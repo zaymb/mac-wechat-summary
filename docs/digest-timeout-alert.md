@@ -1,0 +1,50 @@
+# Digest timeout alert
+
+`digest_timeout_alert.py` records scheduler-observed stage outcomes without
+reading chat content or credentials.  It is intentionally separate from the
+active machine scheduler: code review and deployment can happen independently.
+
+## Contract
+
+- `timeout` is distinct from the ordinary healthy outcomes `success`, `empty`,
+  and `silent`.
+- Every distinct timeout round is appended to a mode-0600 JSONL ledger.
+- The first timeout in an uninterrupted per-stage streak notifies the shared
+  resident channel.  Later rounds remain durable but are notification-suppressed
+  until any healthy outcome resets the streak.
+- The caller supplies the timeout that actually fired.  This helper has no
+  timeout default and does not change the scheduler's existing timeout budget.
+- Notification failures are receipted without recording transport output.  An
+  identical call can retry delivery without duplicating the pipeline event.
+
+The notifier must accept `--slice-id ID`, read plain text from stdin, own its
+transport timeout, and return zero only after a real delivery receipt.  The
+existing digest notification helper has this shape.  Point
+`WECHAT_DIGEST_ALERT_CHAT_ID` at the existing shared household wake channel;
+keep its value in private runtime configuration, not in git.
+
+## Reversible rollout hook (not applied)
+
+The active scheduler is currently an untracked machine-local wrapper at
+`~/wechat-digest.sh`; there is no canonical tracked copy in this repository.
+After review, add one call immediately after each scheduler stage returns.  For
+a timeout, pass the same timeout variable already used by that stage:
+
+```sh
+python3 /path/to/mac-wechat-summary/digest_timeout_alert.py \
+  --ledger "$HOME/.wechat-summary/digest-alert-events.jsonl" \
+  --state "$HOME/.wechat-summary/digest-alert-state.json" \
+  --run-id "$RUN_ID" --stage archive --status timeout \
+  --timeout-seconds "$ARCHIVE_TIMEOUT_SECONDS" \
+  --notifier /path/to/mac-wechat-summary/send_digest_notification.sh
+```
+
+Record `success`, `empty`, or `silent` for the same stage on its corresponding
+healthy path so recovery resets the edge trigger.  Roll back by removing these
+calls; the append-only ledger and state can remain for diagnosis.
+
+Verification after a separately authorized rollout must use an injected fake
+notifier first, then one explicitly labelled shared-channel test.  A valid live
+receipt consists of: one `pipeline_status` row, one successful
+`notification_delivery` row, and the sender's external message receipt.  No
+live notification was sent while developing this helper.
