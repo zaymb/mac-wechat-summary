@@ -25,7 +25,7 @@ import tempfile
 SCHEMA_VERSION = 1
 HEALTHY_STATUSES = frozenset({"success", "empty", "silent"})
 VALID_STATUSES = frozenset({"timeout", *HEALTHY_STATUSES})
-_SAFE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_SAFE_ID = re.compile(r"^[A-Za-z0-9_.:+-]{1,128}$")
 _SAFE_STAGE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 

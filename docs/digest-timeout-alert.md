@@ -23,12 +23,13 @@ existing digest notification helper has this shape.  Point
 `WECHAT_DIGEST_ALERT_CHAT_ID` at the existing shared household wake channel;
 keep its value in private runtime configuration, not in git.
 
-## Reversible rollout hook (not applied)
+## Active rollout hook
 
 The active scheduler is currently an untracked machine-local wrapper at
 `~/wechat-digest.sh`; there is no canonical tracked copy in this repository.
-After review, add one call immediately after each scheduler stage returns.  For
-a timeout, pass the same timeout variable already used by that stage:
+It calls the helper immediately after the archive and file-collector stages
+return.  For a timeout, it passes the same timeout variable already used by
+that stage:
 
 ```sh
 python3 /path/to/mac-wechat-summary/digest_timeout_alert.py \
@@ -62,8 +63,8 @@ Record `success`, `empty`, or `silent` for the same stage on its corresponding
 healthy path so recovery resets the edge trigger.  Roll back by removing these
 calls; the append-only ledger and state can remain for diagnosis.
 
-Verification after a separately authorized rollout must use an injected fake
-notifier first, then one explicitly labelled shared-channel test.  A valid live
+Verification must use an injected fake notifier first, then one explicitly
+labelled shared-channel test.  A valid live
 receipt consists of: one `pipeline_status` row, one successful
 `notification_delivery` row, and the sender's external message receipt.  No
-live notification was sent while developing this helper.
+additional live notification is needed for ordinary code-only regression tests.

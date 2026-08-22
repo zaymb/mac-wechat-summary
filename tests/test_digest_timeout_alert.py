@@ -69,6 +69,14 @@ class DigestTimeoutAlertTests(unittest.TestCase):
         notifications = self.notify_log.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(notifications), 1)
 
+    def test_accepts_wrapper_run_id_with_numeric_timezone_offset(self):
+        notifier = self._notifier()
+
+        result = self._event("20260822T230415+1000-12345", notifier=notifier)
+
+        self.assertTrue(result["recorded"])
+        self.assertEqual(result["notification"], "sent")
+
     def test_success_resets_streak_so_a_later_timeout_alerts_again(self):
         notifier = self._notifier()
         self._event("round-1904", notifier=notifier)
