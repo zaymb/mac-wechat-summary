@@ -12,7 +12,7 @@ from datetime import datetime
 
 import zstandard as zstd
 
-from .decryptor import decrypt_database, decrypt_wal
+from .snapshot_cache import DecryptedSnapshotCache, SnapshotCacheError
 
 _zstd_dctx = zstd.ZstdDecompressor()
 
@@ -91,7 +91,7 @@ class WeChatDB:
 
     CACHE_DIR = os.path.join(tempfile.gettempdir(), "wechat_summary_cache")
 
-    def __init__(self, db_dir, keys):
+    def __init__(self, db_dir, keys, cache_dir=None, diagnostic_sink=None):
         """
         Args:
             db_dir: WeChat db_storage directory path.
@@ -99,32 +99,24 @@ class WeChatDB:
         """
         self.db_dir = db_dir
         self.keys = keys
-        self._db_cache = {}  # rel_key -> (db_mtime, wal_mtime, cache_path)
+        self._snapshot_cache = DecryptedSnapshotCache(
+            db_dir,
+            cache_dir=cache_dir or self.CACHE_DIR,
+            diagnostic_sink=diagnostic_sink,
+        )
         self._contacts = None  # {username: display_name}
         self._contacts_full = None  # [{username, nick_name, remark}]
         self._nick_to_remark = {}  # {nick_name: remark} reverse mapping for nickname→alias lookup
         self._emoticon_map = None  # {md5: {cdn_url, aes_key, thumb_url}}
-        os.makedirs(self.CACHE_DIR, exist_ok=True)
-        try:
-            os.chmod(self.CACHE_DIR, 0o700)
-        except OSError:
-            pass
 
     def invalidate_cache(self):
-        """Clear all DB decryption caches, force re-decrypt on next query."""
-        self._db_cache.clear()
+        """Clear process-local views; versioned disk snapshots stay reusable."""
+        self._snapshot_cache.clear_memory()
+        self._snapshot_cache.release_leases()
         self._contacts = None
         self._contacts_full = None
         self._nick_to_remark = {}
         self._emoticon_map = None
-        # Clean up cached files on disk
-        if os.path.isdir(self.CACHE_DIR):
-            import glob as _glob
-            for f in _glob.glob(os.path.join(self.CACHE_DIR, "*.db")):
-                try:
-                    os.remove(f)
-                except OSError:
-                    pass
 
     def _get_key(self, rel_path):
         """Get database encryption key."""
@@ -161,36 +153,16 @@ class WeChatDB:
         if not enc_key:
             return None
 
-        wal_path = db_path + "-wal"
         try:
-            db_mtime = os.path.getmtime(db_path)
-            wal_mtime = os.path.getmtime(wal_path) if os.path.exists(wal_path) else 0
-        except OSError:
+            return self._snapshot_cache.get_snapshot(rel_path, enc_key)
+        except (OSError, SnapshotCacheError) as exc:
+            resource_id = self._snapshot_cache.resource_id(rel_path)
+            print(
+                f"[wechat-cache] snapshot unavailable resource={resource_id} "
+                f"error={type(exc).__name__}",
+                file=__import__("sys").stderr,
+            )
             return None
-
-        # Check cache
-        if rel_path in self._db_cache:
-            c_db_mt, c_wal_mt, c_path = self._db_cache[rel_path]
-            # After WAL checkpoint, WAL file disappears (wal_mtime goes from non-zero to 0).
-            # If db_mtime also hasn't changed (data merged into main file), cache is still valid.
-            wal_ok = (c_wal_mt == wal_mtime) or (wal_mtime == 0 and c_db_mt == db_mtime)
-            if c_db_mt == db_mtime and wal_ok and os.path.exists(c_path):
-                return c_path
-
-        # Decrypt
-        h = hashlib.md5(rel_path.encode()).hexdigest()[:12]
-        cache_path = os.path.join(self.CACHE_DIR, f"{h}.db")
-
-        pages = decrypt_database(db_path, cache_path, enc_key)
-        if pages == 0:
-            return None
-
-        # Patch WAL
-        if os.path.exists(wal_path):
-            decrypt_wal(wal_path, cache_path, enc_key)
-
-        self._db_cache[rel_path] = (db_mtime, wal_mtime, cache_path)
-        return cache_path
 
     def _load_contacts(self):
         """Load contacts."""
@@ -346,14 +318,42 @@ class WeChatDB:
         table_hash = hashlib.md5(username.encode()).hexdigest()
         table_name = f"Msg_{table_hash}"
 
-        found_paths = []
-
-        # 1) Find message databases with keys
+        # Find message databases with keys.  A persisted chat→shard mapping
+        # avoids decrypting every shard in each short-lived digest process.
         msg_keys = sorted([
             k for k in self.keys
             if re.search(r"message[/\\](?:biz_)?message_\d+\.db$", k.replace("\\", "/"))
         ])
 
+        mapped_keys = self._snapshot_cache.get_message_shards(username, msg_keys)
+        if mapped_keys is not None:
+            mapped_paths = []
+            mapping_valid = True
+            for rel_key in mapped_keys:
+                path = self._get_decrypted_db(rel_key)
+                if not path:
+                    mapping_valid = False
+                    break
+                conn = sqlite3.connect(path)
+                try:
+                    exists = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                        (table_name,),
+                    ).fetchone()
+                except sqlite3.Error:
+                    exists = None
+                finally:
+                    conn.close()
+                if not exists:
+                    mapping_valid = False
+                    break
+                mapped_paths.append(path)
+            if mapping_valid:
+                return mapped_paths, table_name
+            self._snapshot_cache.forget_message_shards(username)
+
+        found_paths = []
+        found_keys = []
         for rel_key in msg_keys:
             path = self._get_decrypted_db(rel_key)
             if not path:
@@ -366,34 +366,19 @@ class WeChatDB:
                 ).fetchone()
                 if exists:
                     found_paths.append(path)
+                    found_keys.append(rel_key)
             except Exception:
                 pass
             finally:
                 conn.close()
 
-        # 2) If not found, search for old decrypted files in cache
-        if not found_paths:
-            for prefix in ("message", "biz_message"):
-                for i in range(10):
-                    rel = f"message/{prefix}_{i}.db"
-                    if rel in self.keys:
-                        continue
-                    h = hashlib.md5(rel.encode()).hexdigest()[:12]
-                    cache_path = os.path.join(self.CACHE_DIR, f"{h}.db")
-                    if not os.path.exists(cache_path):
-                        continue
-                    conn = sqlite3.connect(cache_path)
-                    try:
-                        exists = conn.execute(
-                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                            (table_name,),
-                        ).fetchone()
-                        if exists:
-                            found_paths.append(cache_path)
-                    except Exception:
-                        pass
-                    finally:
-                        conn.close()
+        # Never fall back to an unversioned old decrypted file: that can serve
+        # stale rows after a WAL checkpoint or source replacement.
+        self._snapshot_cache.put_message_shards(
+            username,
+            msg_keys,
+            found_keys,
+        )
 
         if found_paths:
             return found_paths, table_name
