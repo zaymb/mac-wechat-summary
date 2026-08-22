@@ -39,6 +39,25 @@ python3 /path/to/mac-wechat-summary/digest_timeout_alert.py \
   --notifier /path/to/mac-wechat-summary/send_digest_notification.sh
 ```
 
+The alert helper returning nonzero means notification delivery failed, not that
+the scheduler stage acquired a new outcome.  Capture it separately and continue;
+never let it overwrite the original stage status or abort the digest:
+
+```sh
+alert_status=0
+python3 /path/to/mac-wechat-summary/digest_timeout_alert.py ... \
+  || alert_status=$?
+if [ "$alert_status" -ne 0 ]; then
+  printf 'digest timeout alert delivery failed (status=%s)\n' \
+    "$alert_status" >&2
+fi
+```
+
+The durable `notification_delivery` failure receipt is the retry/diagnostic
+signal.  This separation is required even when the wrapper is not using
+`set -e` today, so a later shell-mode change cannot turn an alert failure into a
+digest failure.
+
 Record `success`, `empty`, or `silent` for the same stage on its corresponding
 healthy path so recovery resets the edge trigger.  Roll back by removing these
 calls; the append-only ledger and state can remain for diagnosis.

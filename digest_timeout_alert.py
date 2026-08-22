@@ -58,20 +58,6 @@ def _event_id(run_id, stage, status):
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
-def _read_state(path):
-    if not path.exists():
-        return {"schema_version": SCHEMA_VERSION, "stages": {}}
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise AlertError("alert state is unreadable; refusing to overwrite it") from exc
-    if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
-        raise AlertError("alert state has an unsupported schema")
-    if not isinstance(value.get("stages"), dict):
-        raise AlertError("alert state has an invalid stages map")
-    return value
-
-
 def _write_state_atomic(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -127,6 +113,67 @@ def _append_ledger(path, row):
         os.close(fd)
 
 
+def _project_state(rows):
+    """Rebuild the disposable per-stage projection from durable receipts."""
+    state = {"schema_version": SCHEMA_VERSION, "stages": {}}
+    event_stage = {}
+    active_events = {}
+
+    for row in rows:
+        record_type = row.get("record_type")
+        if record_type == "pipeline_status":
+            event_id = row.get("event_id")
+            stage = row.get("stage")
+            status = row.get("status")
+            if (
+                not isinstance(event_id, str)
+                or not isinstance(stage, str)
+                or status not in VALID_STATUSES
+            ):
+                raise AlertError("alert ledger contains an invalid pipeline receipt")
+            stage_state = state["stages"].setdefault(
+                stage,
+                {
+                    "active_timeout": False,
+                    "streak": 0,
+                    "alert_delivered": False,
+                },
+            )
+            event_stage[event_id] = stage
+            if status == "timeout":
+                if stage_state["active_timeout"]:
+                    stage_state["streak"] += 1
+                else:
+                    stage_state.update(
+                        {
+                            "active_timeout": True,
+                            "streak": 1,
+                            "alert_delivered": False,
+                        }
+                    )
+                    active_events[stage] = set()
+                active_events.setdefault(stage, set()).add(event_id)
+            else:
+                stage_state.update(
+                    {
+                        "active_timeout": False,
+                        "streak": 0,
+                        "alert_delivered": False,
+                    }
+                )
+                active_events[stage] = set()
+            stage_state["last_event_id"] = event_id
+            stage_state["last_status"] = status
+            stage_state["last_observed_at"] = row.get("occurred_at")
+        elif record_type == "notification_delivery" and row.get("status") == "sent":
+            event_id = row.get("event_id")
+            stage = event_stage.get(event_id)
+            if stage and event_id in active_events.get(stage, set()):
+                state["stages"][stage]["alert_delivered"] = True
+
+    return state, active_events
+
+
 @contextlib.contextmanager
 def _exclusive_lock(state_path):
     lock_path = state_path.with_name(f"{state_path.name}.lock")
@@ -150,7 +197,7 @@ def _notification_message(event):
     )
 
 
-def _deliver(notifier, chat_id, event, ledger_path, attempted_at):
+def _deliver(notifier, chat_id, event, attempted_at):
     if not notifier:
         return {
             "schema_version": SCHEMA_VERSION,
@@ -233,8 +280,8 @@ def process_event(
     event_id = _event_id(run_id, stage, status)
 
     with _exclusive_lock(state_path):
-        state = _read_state(state_path)
         rows = _read_ledger(ledger_path)
+        state, active_events = _project_state(rows)
         existing = next(
             (
                 row
@@ -244,28 +291,25 @@ def process_event(
             ),
             None,
         )
-        successful_delivery = any(
-            row.get("record_type") == "notification_delivery"
-            and row.get("event_id") == event_id
-            and row.get("status") == "sent"
-            for row in rows
-        )
-
         stage_state = state["stages"].setdefault(
             stage,
             {"active_timeout": False, "streak": 0, "alert_delivered": False},
         )
 
         if existing:
-            if status != "timeout" or successful_delivery:
+            retryable = (
+                status == "timeout"
+                and stage_state.get("active_timeout")
+                and event_id in active_events.get(stage, set())
+                and not stage_state.get("alert_delivered")
+            )
+            if not retryable:
                 return {
                     "event_id": event_id,
                     "recorded": False,
                     "notification": "duplicate_suppressed",
                 }
-            delivery = _deliver(
-                notifier, chat_id, existing, ledger_path, occurred_at
-            )
+            delivery = _deliver(notifier, chat_id, existing, occurred_at)
             _append_ledger(ledger_path, delivery)
             stage_state["alert_delivered"] = delivery["status"] == "sent"
             _write_state_atomic(state_path, state)
@@ -316,7 +360,7 @@ def process_event(
 
         notification = disposition
         if should_notify:
-            delivery = _deliver(notifier, chat_id, event, ledger_path, occurred_at)
+            delivery = _deliver(notifier, chat_id, event, occurred_at)
             _append_ledger(ledger_path, delivery)
             stage_state["alert_delivered"] = delivery["status"] == "sent"
             notification = delivery["status"]

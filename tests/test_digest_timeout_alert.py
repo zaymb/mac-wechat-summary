@@ -112,6 +112,32 @@ class DigestTimeoutAlertTests(unittest.TestCase):
         self.assertEqual(len(pipeline), 1)
         self.assertEqual([r["status"] for r in delivery], ["failed", "sent"])
 
+    def test_missing_state_rebuilds_streak_from_ledger_without_realerting(self):
+        notifier = self._notifier()
+        self._event("round-1904", notifier=notifier)
+        self.state.unlink()
+
+        second = self._event("round-2104", notifier=notifier)
+
+        self.assertEqual(second["notification"], "suppressed")
+        self.assertEqual(second["timeout_streak"], 2)
+        self.assertEqual(
+            len(self.notify_log.read_text(encoding="utf-8").splitlines()), 1
+        )
+
+    def test_replaying_older_failed_event_after_later_delivery_is_suppressed(self):
+        notifier = self._notifier(fail_first=True)
+        first = self._event("round-1904", notifier=notifier)
+        second = self._event("round-2104", notifier=notifier)
+        replay = self._event("round-1904", notifier=notifier)
+
+        self.assertEqual(first["notification"], "failed")
+        self.assertEqual(second["notification"], "sent")
+        self.assertEqual(replay["notification"], "duplicate_suppressed")
+        self.assertEqual(
+            len(self.notify_log.read_text(encoding="utf-8").splitlines()), 2
+        )
+
     def test_empty_and_silent_are_recorded_as_healthy_not_timeout(self):
         self._event("round-empty", status="empty")
         self._event("round-silent", status="silent")
