@@ -367,7 +367,7 @@ class SnapshotCacheTests(unittest.TestCase):
             conn.execute(f"CREATE TABLE [{table_name}](create_time INTEGER)")
 
         paths, table = db._find_msg_table(username)
-        self.assertEqual(paths, [str(self.source)])
+        self.assertEqual(paths, [REL_PATH])
         self.assertEqual(table, table_name)
 
     def test_nonempty_mapping_survives_data_writes_but_not_new_shards(self):

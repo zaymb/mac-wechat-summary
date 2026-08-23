@@ -2,22 +2,95 @@
 WeChat database queries - contacts, group chats, and message reading.
 Based on the query logic from the wechat-decrypt project's mcp_server.py.
 """
+import html
 import hashlib
 import json
 import os
 import re
 import sqlite3
 import tempfile
+from collections import defaultdict
 from datetime import datetime
 
 import zstandard as zstd
+
+try:
+    from pysqlcipher3 import dbapi2 as _sqlcipher
+    _HAS_SQLCIPHER = True
+except ImportError:
+    _HAS_SQLCIPHER = False
 
 from .snapshot_cache import DecryptedSnapshotCache, SnapshotCacheError
 
 _zstd_dctx = zstd.ZstdDecompressor()
 
-# Regex to extract <title> from XML messages
-_RE_TITLE = re.compile(r"<title>(.*?)</title>", re.DOTALL)
+_RE_APPMSG_TYPE = re.compile(r"<type>\s*(\d+)\s*</type>", re.DOTALL)
+
+
+def _extract_xml_text(text, tag):
+    """Extract and decode one simple XML element from an appmsg payload."""
+    match = re.search(
+        rf"<{re.escape(tag)}(?:\s[^>]*)?>(.*?)</{re.escape(tag)}>",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    value = match.group(1).strip()
+    if value.startswith("<![CDATA[") and value.endswith("]]>"):
+        value = value[9:-3]
+    return html.unescape(value.strip())
+
+
+def _extract_http_url(text):
+    """Return a shareable http(s) URL from an appmsg, never file CDN tokens."""
+    value = _extract_xml_text(text, "url")
+    if re.match(r"^https?://", value, re.IGNORECASE):
+        return value
+    return ""
+
+
+def _parse_file_appmsg(text):
+    """Parse the stable metadata needed to locate a cached WeChat file."""
+    type_match = _RE_APPMSG_TYPE.search(text or "")
+    if not type_match or type_match.group(1) != "6":
+        return None
+
+    title = _extract_xml_text(text, "title")
+    if not title:
+        return None
+
+    size_text = _extract_xml_text(text, "totallen")
+    try:
+        size = int(size_text)
+    except (TypeError, ValueError):
+        size = 0
+
+    md5 = _extract_xml_text(text, "md5").lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", md5):
+        md5 = ""
+
+    return {
+        "title": title,
+        "size": size,
+        "md5": md5,
+        "fileext": _extract_xml_text(text, "fileext").lstrip("."),
+    }
+
+
+def _decode_message_content(content, compression_type):
+    """Decode a WCDB message_content value, including zstd-compressed rows."""
+    if compression_type == 4 and isinstance(content, bytes):
+        try:
+            return _zstd_dctx.decompress(content).decode("utf-8", errors="replace")
+        except Exception:
+            return None
+    if isinstance(content, bytes):
+        try:
+            return content.decode("utf-8", errors="replace")
+        except Exception:
+            return None
+    return content
 
 
 def _clean_msg_text(text):
@@ -44,21 +117,23 @@ def _clean_msg_text(text):
 
     # ── appmsg: quoted replies, links, files, pat ──
     if "<appmsg" in stripped:
-        m = _RE_TITLE.search(stripped)
-        if m:
-            title = m.group(1).strip()
-            if not title:
-                return None
+        title = _extract_xml_text(stripped, "title")
+        if title:
+            type_match = _RE_APPMSG_TYPE.search(stripped)
+            appmsg_type = type_match.group(1) if type_match else ""
             # Pat-pat: title contains "拍了拍"
             if "拍了拍" in title:
                 return None
             # Quoted reply (type=57): extract title as reply content
-            if "<type>57</type>" in stripped:
+            if appmsg_type == "57":
                 return f"[回复] {title}"
             # File (type=6)
-            if "<type>6</type>" in stripped:
+            if appmsg_type == "6":
                 return f"[文件] {title}"
             # Link/article (type=5 or other)
+            url = _extract_http_url(stripped)
+            if url:
+                return f"[链接] {title} — {url}"
             return f"[链接] {title}"
         return None
 
@@ -108,6 +183,8 @@ class WeChatDB:
         self._contacts_full = None  # [{username, nick_name, remark}]
         self._nick_to_remark = {}  # {nick_name: remark} reverse mapping for nickname→alias lookup
         self._emoticon_map = None  # {md5: {cdn_url, aes_key, thumb_url}}
+        self._file_cache_by_size = None
+        self._file_md5_cache = {}
 
     def invalidate_cache(self):
         """Clear process-local views; versioned disk snapshots stay reusable."""
@@ -163,6 +240,29 @@ class WeChatDB:
                 file=__import__("sys").stderr,
             )
             return None
+
+    def _open_encrypted_conn(self, rel_path):
+        """Open an encrypted DB directly via pysqlcipher3 (no full-file decrypt).
+
+        Falls back to the old decrypt-to-file path when pysqlcipher3 is unavailable.
+        Returns a sqlite3-compatible connection or None.
+        """
+        db_path = os.path.join(self.db_dir, rel_path)
+        if not os.path.exists(db_path):
+            return None
+        if self._is_plain_sqlite(db_path):
+            return sqlite3.connect(db_path)
+        if not _HAS_SQLCIPHER:
+            decrypted = self._get_decrypted_db(rel_path)
+            return sqlite3.connect(decrypted) if decrypted else None
+        enc_key = self._get_key(rel_path)
+        if not enc_key:
+            return None
+        conn = _sqlcipher.connect(db_path)
+        conn.execute(f"PRAGMA key = \"x'{enc_key}'\"")
+        conn.execute("PRAGMA cipher_compatibility = 4")
+        conn.execute("PRAGMA cipher_page_size = 4096")
+        return conn
 
     def _load_contacts(self):
         """Load contacts."""
@@ -309,17 +409,16 @@ class WeChatDB:
     def _find_msg_table(self, username):
         """Find all databases containing a user's message table.
 
-        Searches all message-related database files (message_N.db and biz_message_N.db),
-        returns all database paths containing the table (messages may span multiple DBs).
+        When pysqlcipher3 is available, opens encrypted DBs directly (no full
+        decrypt). Falls back to the old snapshot-cache path otherwise.
 
         Returns:
-            (list[str], str): (db_paths, table_name), returns ([], None) if not found.
+            (list[str], str): (rel_keys, table_name), returns ([], None) if not found.
+            The rel_keys are database-relative paths suitable for _open_encrypted_conn.
         """
         table_hash = hashlib.md5(username.encode()).hexdigest()
         table_name = f"Msg_{table_hash}"
 
-        # Find message databases with keys.  A persisted chat→shard mapping
-        # avoids decrypting every shard in each short-lived digest process.
         msg_keys = sorted([
             k for k in self.keys
             if re.search(r"message[/\\](?:biz_)?message_\d+\.db$", k.replace("\\", "/"))
@@ -327,76 +426,70 @@ class WeChatDB:
 
         mapped_keys = self._snapshot_cache.get_message_shards(username, msg_keys)
         if mapped_keys is not None:
-            mapped_paths = []
             mapping_valid = True
             for rel_key in mapped_keys:
-                path = self._get_decrypted_db(rel_key)
-                if not path:
+                conn = self._open_encrypted_conn(rel_key)
+                if not conn:
                     mapping_valid = False
                     break
-                conn = sqlite3.connect(path)
                 try:
                     exists = conn.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
                         (table_name,),
                     ).fetchone()
-                except sqlite3.Error:
+                except Exception:
                     exists = None
                 finally:
                     conn.close()
                 if not exists:
                     mapping_valid = False
                     break
-                mapped_paths.append(path)
             if mapping_valid:
-                return mapped_paths, table_name
+                return mapped_keys, table_name
             self._snapshot_cache.forget_message_shards(username)
 
-        found_paths = []
         found_keys = []
         for rel_key in msg_keys:
-            path = self._get_decrypted_db(rel_key)
-            if not path:
+            conn = self._open_encrypted_conn(rel_key)
+            if not conn:
                 continue
-            conn = sqlite3.connect(path)
             try:
                 exists = conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
                     (table_name,),
                 ).fetchone()
                 if exists:
-                    found_paths.append(path)
                     found_keys.append(rel_key)
             except Exception:
                 pass
             finally:
                 conn.close()
 
-        # Never fall back to an unversioned old decrypted file: that can serve
-        # stale rows after a WAL checkpoint or source replacement.
         self._snapshot_cache.put_message_shards(
             username,
             msg_keys,
             found_keys,
         )
 
-        if found_paths:
-            return found_paths, table_name
+        if found_keys:
+            return found_keys, table_name
         return [], None
 
     def count_messages_since(self, username, since_ts):
-        """Quick count of new messages since since_ts (reads cached copy only, safe).
+        """Quick count of new messages since since_ts.
 
         Returns:
             int: Number of new messages, -1 on query failure.
         """
-        db_paths, table_name = self._find_msg_table(username)
-        if not db_paths:
+        rel_keys, table_name = self._find_msg_table(username)
+        if not rel_keys:
             return -1
 
         total = 0
-        for db_path in db_paths:
-            conn = sqlite3.connect(db_path)
+        for rel_key in rel_keys:
+            conn = self._open_encrypted_conn(rel_key)
+            if not conn:
+                continue
             try:
                 row = conn.execute(
                     f"SELECT COUNT(*) FROM [{table_name}] WHERE create_time > ?",
@@ -423,14 +516,15 @@ class WeChatDB:
         self._load_contacts()
         is_group = "@chatroom" in username
 
-        db_paths, table_name = self._find_msg_table(username)
-        if not db_paths:
+        rel_keys, table_name = self._find_msg_table(username)
+        if not rel_keys:
             return []
 
-        # Collect rows from all DBs, merge, sort, and truncate
         all_rows = []
-        for db_path in db_paths:
-            conn = sqlite3.connect(db_path)
+        for rel_key in rel_keys:
+            conn = self._open_encrypted_conn(rel_key)
+            if not conn:
+                continue
             try:
                 if since_ts > 0:
                     rows = conn.execute(f"""
@@ -516,6 +610,178 @@ class WeChatDB:
                 "type": local_type,
             })
 
+        return messages
+
+    def _build_file_cache_index(self):
+        """Index WeChat's already-downloaded generic file cache by byte size."""
+        if self._file_cache_by_size is not None:
+            return self._file_cache_by_size
+
+        by_size = defaultdict(list)
+        file_root = os.path.join(os.path.dirname(self.db_dir), "msg", "file")
+        if os.path.isdir(file_root):
+            for root, _dirs, names in os.walk(file_root):
+                for name in names:
+                    path = os.path.join(root, name)
+                    try:
+                        if os.path.isfile(path):
+                            by_size[os.path.getsize(path)].append(path)
+                    except OSError:
+                        continue
+        self._file_cache_by_size = by_size
+        return by_size
+
+    def _cached_file_md5(self, path):
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return ""
+        cache_key = (path, stat.st_size, stat.st_mtime_ns)
+        if cache_key in self._file_md5_cache:
+            return self._file_md5_cache[cache_key]
+
+        digest = hashlib.md5()
+        try:
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return ""
+        value = digest.hexdigest()
+        self._file_md5_cache[cache_key] = value
+        return value
+
+    def _find_cached_file(self, metadata, create_time):
+        """Match appmsg metadata to a file in WeChat's local cache."""
+        size = metadata.get("size") or 0
+        if size <= 0:
+            return None
+
+        candidates = list(self._build_file_cache_index().get(size, ()))
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda path: abs(os.path.getmtime(path) - create_time)
+            if os.path.exists(path)
+            else float("inf")
+        )
+
+        expected_md5 = metadata.get("md5") or ""
+        if expected_md5:
+            for path in candidates:
+                if self._cached_file_md5(path) == expected_md5:
+                    return path
+            return None
+
+        # Older appmsg rows can omit md5. In that case, require a very close
+        # timestamp and matching extension rather than guessing by size alone.
+        expected_ext = metadata.get("fileext") or ""
+        for path in candidates:
+            try:
+                if abs(os.path.getmtime(path) - create_time) > 60:
+                    continue
+            except OSError:
+                continue
+            actual_ext = os.path.splitext(path)[1].lstrip(".")
+            if expected_ext and actual_ext.lower() != expected_ext.lower():
+                continue
+            return path
+        return None
+
+    def find_cached_file(self, metadata, create_time):
+        """Public cache lookup used by the idempotent file collector."""
+        return self._find_cached_file(metadata, create_time)
+
+    def get_file_messages(
+        self,
+        username,
+        since_ts=0,
+        limit=10000,
+        include_scan_watermark=False,
+    ):
+        """Read file-share messages and resolve already-downloaded cache paths.
+
+        Rows are consumed oldest-first so callers can keep an independent,
+        lossless cursor even when a chat has more than ``limit`` new messages.
+        ``include_scan_watermark`` returns ``(files, latest_scanned_ts)``;
+        the watermark advances across non-file messages too.
+        """
+        self._load_contacts()
+        is_group = "@chatroom" in username
+        db_paths, table_name = self._find_msg_table(username)
+        if not db_paths:
+            result = ([], since_ts) if include_scan_watermark else []
+            return result
+
+        all_rows = []
+        for db_path in db_paths:
+            conn = sqlite3.connect(db_path)
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT local_type, create_time, message_content,
+                           WCDB_CT_message_content, status
+                    FROM [{table_name}]
+                    WHERE create_time > ?
+                    ORDER BY create_time ASC
+                    LIMIT ?
+                    """,
+                    (since_ts, limit),
+                ).fetchall()
+                all_rows.extend(rows)
+            except Exception:
+                pass
+            finally:
+                conn.close()
+
+        all_rows.sort(key=lambda row: row[1])
+        rows = all_rows[:limit]
+        watermark = rows[-1][1] if rows else since_ts
+
+        contact_name = ""
+        if not is_group:
+            contact_name = self._contacts.get(username, username)
+
+        messages = []
+        for local_type, create_time, content, compression_type, status in rows:
+            content = _decode_message_content(content, compression_type)
+            if not content:
+                continue
+
+            sender = ""
+            raw_sender_id = ""
+            text = content
+            if is_group and ":\n" in content:
+                raw_sender_id, text = content.split(":\n", 1)
+                sender = self._contacts.get(raw_sender_id)
+                if not sender:
+                    sender = self._nick_to_remark.get(raw_sender_id, raw_sender_id)
+            elif not is_group:
+                sender = "我" if status == 2 else contact_name
+            if is_group and not sender:
+                sender = "您"
+
+            metadata = _parse_file_appmsg(text)
+            if not metadata:
+                continue
+
+            messages.append({
+                "sender": sender,
+                "raw_sender_id": raw_sender_id,
+                "title": metadata["title"],
+                "size": metadata["size"],
+                "md5": metadata["md5"],
+                "fileext": metadata["fileext"],
+                "timestamp": create_time,
+                "time_str": datetime.fromtimestamp(create_time).strftime(
+                    "%Y-%m-%d %H:%M"
+                ),
+                "type": local_type,
+                "cache_path": self._find_cached_file(metadata, create_time),
+            })
+
+        if include_scan_watermark:
+            return messages, watermark
         return messages
 
     def _get_fts_db(self):
