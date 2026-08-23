@@ -174,17 +174,50 @@ class DecryptedSnapshotCache:
 
     @staticmethod
     def _validate_built_snapshot(path: str) -> None:
+        """Validate the SQLite envelope without scanning every data page.
+
+        ``PRAGMA quick_check`` is linear in the entire database and is not a
+        bounded smoke test: on the current 650+ MiB message shard it can spend
+        tens of minutes walking b-trees after decryption has already finished.
+        Snapshot publication only needs to establish that the complete output
+        has a coherent SQLite header, page geometry, and readable schema.  The
+        source-stability check immediately after this method still proves that
+        the bytes came from the exact DB+WAL version being published.
+        """
         try:
+            stat = os.stat(path)
+            with open(path, "rb") as handle:
+                if handle.read(16) != b"SQLite format 3\x00":
+                    raise SnapshotCacheError(
+                        "decrypted snapshot has no SQLite header"
+                    )
             uri = Path(path).resolve().as_uri() + "?mode=ro&immutable=1"
             conn = sqlite3.connect(uri, uri=True, timeout=5)
             try:
-                row = conn.execute("PRAGMA quick_check(1)").fetchone()
+                page_size_row = conn.execute("PRAGMA page_size").fetchone()
+                page_count_row = conn.execute("PRAGMA page_count").fetchone()
+                conn.execute("PRAGMA schema_version").fetchone()
+                conn.execute(
+                    "SELECT type, name, rootpage FROM sqlite_schema ORDER BY rowid"
+                ).fetchall()
             finally:
                 conn.close()
-        except sqlite3.Error as exc:
+        except SnapshotCacheError:
+            raise
+        except (OSError, sqlite3.Error) as exc:
             raise SnapshotCacheError("decrypted snapshot is not readable SQLite") from exc
-        if not row or row[0] != "ok":
-            raise SnapshotCacheError("decrypted snapshot failed SQLite quick_check")
+        if not page_size_row or not page_count_row:
+            raise SnapshotCacheError("decrypted snapshot has no SQLite page geometry")
+        page_size = int(page_size_row[0])
+        page_count = int(page_count_row[0])
+        if (
+            page_size <= 0
+            or page_count <= 0
+            or page_size * page_count != stat.st_size
+        ):
+            raise SnapshotCacheError(
+                "decrypted snapshot has inconsistent SQLite page geometry"
+            )
 
     def _emit(self, event: dict) -> None:
         safe_event = {

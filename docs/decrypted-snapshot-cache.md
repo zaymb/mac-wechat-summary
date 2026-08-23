@@ -22,10 +22,14 @@ root-cause fix.
 - a one-way encryption-key fingerprint.
 
 The builder holds a per-resource cross-process `flock`, decrypts to a unique
-temporary file, patches the matching WAL, runs SQLite `quick_check`, and then
-rechecks the source signature. Only a stable build is published with atomic
-rename and a matching atomic manifest. A source that changes twice during the
-two allowed attempts fails closed; an older snapshot is never substituted.
+temporary file, patches the matching WAL, validates the SQLite header, page
+geometry, and schema, and then rechecks the source signature. Validation is
+bounded to SQLite metadata rather than `PRAGMA quick_check`: the latter scans
+the entire database and took tens of minutes on the 650+ MiB message shard even
+though decryption itself finished in seconds. Only a stable build is published
+with atomic rename and a matching atomic manifest. A source that changes twice
+during the two allowed attempts fails closed; an older snapshot is never
+substituted.
 
 Fresh processes naturally share the cache because archive, collector, and MCP
 all construct `WeChatDB` with the same default cache root. The first stage that

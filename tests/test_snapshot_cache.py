@@ -11,7 +11,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from core.snapshot_cache import DecryptedSnapshotCache, SourceChangedError
+from core.snapshot_cache import (
+    DecryptedSnapshotCache,
+    SnapshotCacheError,
+    SourceChangedError,
+)
 from core.wechat_db import WeChatDB
 
 
@@ -174,6 +178,37 @@ class SnapshotCacheTests(unittest.TestCase):
         cache.get_snapshot(REL_PATH, KEY)
 
         self.assertFalse(orphan.exists())
+
+    def test_snapshot_validation_reads_schema_without_full_quick_check(self):
+        queries = []
+        real_connect = sqlite3.connect
+
+        class RecordingConnection:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def execute(self, sql, *args, **kwargs):
+                queries.append(sql)
+                return self.inner.execute(sql, *args, **kwargs)
+
+            def close(self):
+                self.inner.close()
+
+        def recording_connect(*args, **kwargs):
+            return RecordingConnection(real_connect(*args, **kwargs))
+
+        with mock.patch("core.snapshot_cache.sqlite3.connect", recording_connect):
+            DecryptedSnapshotCache._validate_built_snapshot(str(self.source))
+
+        self.assertTrue(any("sqlite_schema" in query for query in queries))
+        self.assertFalse(any("quick_check" in query for query in queries))
+
+    def test_snapshot_validation_rejects_non_sqlite_file(self):
+        invalid = self.root / "invalid.db"
+        invalid.write_bytes(b"not a sqlite database")
+
+        with self.assertRaises(SnapshotCacheError):
+            DecryptedSnapshotCache._validate_built_snapshot(str(invalid))
 
     def test_source_that_changes_during_both_attempts_fails_closed(self):
         calls = []
