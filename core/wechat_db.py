@@ -27,6 +27,17 @@ _zstd_dctx = zstd.ZstdDecompressor()
 
 _RE_APPMSG_TYPE = re.compile(r"<type>\s*(\d+)\s*</type>", re.DOTALL)
 
+# WCDB's message sort key is a millisecond-scale sequence. A 50,000-row sample
+# from the live database showed ``sort_seq >= create_time * 1000`` for every
+# row (the observed suffix ranged from 0 to 6001). Queries keep create_time as
+# the exact predicate; this coarse lower bound exists only to enter the
+# SORTSEQ index near the durable cursor instead of scanning the whole shard.
+_SORT_SEQ_PER_SECOND = 1000
+
+
+def _sort_seq_lower_bound(timestamp):
+    return max(0, int(float(timestamp) * _SORT_SEQ_PER_SECOND))
+
 
 def _extract_xml_text(text, tag):
     """Extract and decode one simple XML element from an appmsg payload."""
@@ -497,8 +508,11 @@ class WeChatDB:
                 continue
             try:
                 row = conn.execute(
-                    f"SELECT COUNT(*) FROM [{table_name}] WHERE create_time > ?",
-                    (since_ts,),
+                    f"""
+                    SELECT COUNT(*) FROM [{table_name}]
+                    WHERE sort_seq >= ? AND create_time > ?
+                    """,
+                    (_sort_seq_lower_bound(since_ts), since_ts),
                 ).fetchone()
                 total += row[0] if row else 0
             except Exception:
@@ -537,26 +551,36 @@ class WeChatDB:
                         SELECT local_type, create_time, message_content,
                                WCDB_CT_message_content, status
                         FROM [{table_name}]
-                        WHERE create_time > ? AND create_time <= ?
-                        ORDER BY create_time DESC
+                        WHERE sort_seq >= ?
+                          AND create_time > ? AND create_time <= ?
+                        ORDER BY sort_seq DESC
                         LIMIT ?
-                    """, (since_ts, until_ts, limit * 2)).fetchall()
+                    """, (
+                        _sort_seq_lower_bound(since_ts),
+                        since_ts,
+                        until_ts,
+                        limit * 2,
+                    )).fetchall()
                 elif since_ts > 0:
                     rows = conn.execute(f"""
                         SELECT local_type, create_time, message_content,
                                WCDB_CT_message_content, status
                         FROM [{table_name}]
-                        WHERE create_time > ?
-                        ORDER BY create_time DESC
+                        WHERE sort_seq >= ? AND create_time > ?
+                        ORDER BY sort_seq DESC
                         LIMIT ?
-                    """, (since_ts, limit * 2)).fetchall()
+                    """, (
+                        _sort_seq_lower_bound(since_ts),
+                        since_ts,
+                        limit * 2,
+                    )).fetchall()
                 elif until_ts is not None:
                     rows = conn.execute(f"""
                         SELECT local_type, create_time, message_content,
                                WCDB_CT_message_content, status
                         FROM [{table_name}]
                         WHERE create_time <= ?
-                        ORDER BY create_time DESC
+                        ORDER BY sort_seq DESC
                         LIMIT ?
                     """, (until_ts, limit)).fetchall()
                 else:
@@ -564,7 +588,7 @@ class WeChatDB:
                         SELECT local_type, create_time, message_content,
                                WCDB_CT_message_content, status
                         FROM [{table_name}]
-                        ORDER BY create_time DESC
+                        ORDER BY sort_seq DESC
                         LIMIT ?
                     """, (limit,)).fetchall()
                 all_rows.extend(rows)
@@ -584,43 +608,51 @@ class WeChatDB:
 
     def _iter_msg_rows_ascending_shard(self, table_name, rel_key, after_ts,
                                        until_ts, batch_size):
-        """Stream one message shard by the stable (timestamp, rowid) key."""
+        """Stream one message shard by the indexed (sort_seq, rowid) key."""
         conn = self._open_encrypted_conn(rel_key)
         if not conn:
             raise RuntimeError(f"cannot open message shard: {rel_key}")
-        cursor_ts = float(after_ts)
+        exact_after_ts = float(after_ts)
+        cursor_sort_seq = None
         cursor_rowid = None
         try:
             while True:
                 if cursor_rowid is None:
-                    where = "create_time > ?"
-                    params = [cursor_ts]
+                    where = "sort_seq >= ? AND create_time > ?"
+                    params = [
+                        _sort_seq_lower_bound(exact_after_ts),
+                        exact_after_ts,
+                    ]
                 else:
                     where = (
-                        "(create_time > ? OR "
-                        "(create_time = ? AND rowid > ?))"
+                        "(sort_seq, rowid) > (?, ?) "
+                        "AND create_time > ?"
                     )
-                    params = [cursor_ts, cursor_ts, cursor_rowid]
+                    params = [
+                        cursor_sort_seq,
+                        cursor_rowid,
+                        exact_after_ts,
+                    ]
                 if until_ts is not None:
                     where += " AND create_time <= ?"
                     params.append(until_ts)
                 params.append(batch_size)
                 rows = conn.execute(f"""
-                    SELECT rowid, local_type, create_time, message_content,
+                    SELECT sort_seq, rowid, local_type, create_time, message_content,
                            WCDB_CT_message_content, status
                     FROM [{table_name}]
                     WHERE {where}
-                    ORDER BY create_time ASC, rowid ASC
+                    ORDER BY sort_seq ASC, rowid ASC
                     LIMIT ?
                 """, params).fetchall()
                 if not rows:
                     return
                 for row in rows:
-                    yield row[1:]
+                    yield row
                 if len(rows) < batch_size:
                     return
-                cursor_rowid = rows[-1][0]
-                cursor_ts = rows[-1][2]
+                cursor_sort_seq = rows[-1][0]
+                cursor_rowid = rows[-1][1]
         finally:
             conn.close()
 
@@ -651,12 +683,12 @@ class WeChatDB:
             )
             for rel_key in rel_keys
         ]
-        merged_rows = heapq.merge(*streams, key=lambda row: row[1])
+        merged_rows = heapq.merge(*streams, key=lambda row: (row[0], row[1]))
         while True:
             batch = []
             try:
                 for _ in range(batch_size):
-                    batch.append(next(merged_rows))
+                    batch.append(next(merged_rows)[2:])
             except StopIteration:
                 pass
             if not batch:
@@ -837,11 +869,11 @@ class WeChatDB:
                     SELECT local_type, create_time, message_content,
                            WCDB_CT_message_content, status
                     FROM [{table_name}]
-                    WHERE create_time > ?
-                    ORDER BY create_time ASC
+                    WHERE sort_seq >= ? AND create_time > ?
+                    ORDER BY sort_seq ASC
                     LIMIT ?
                     """,
-                    (since_ts, limit),
+                    (_sort_seq_lower_bound(since_ts), since_ts, limit),
                 ).fetchall()
                 all_rows.extend(rows)
             except Exception:

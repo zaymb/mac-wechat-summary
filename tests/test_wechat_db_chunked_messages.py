@@ -9,8 +9,9 @@ from core.wechat_db import WeChatDB
 def _make_db(db, n_rows, start_ts=1000.0):
     for i in range(n_rows):
         db.execute(
-            "INSERT INTO chat VALUES (?, ?, ?, ?, ?)",
-            (1, start_ts + i, f"message-{i}", 0, 3),
+            "INSERT INTO chat VALUES (?, ?, ?, ?, ?, ?)",
+            (int((start_ts + i) * 1000), 1, start_ts + i,
+             f"message-{i}", 0, 3),
         )
     db.commit()
 
@@ -31,6 +32,7 @@ class IterMessagesAscendingTests(unittest.TestCase):
         conn.execute(
             """
             CREATE TABLE chat (
+                sort_seq INTEGER,
                 local_type INTEGER,
                 create_time REAL,
                 message_content BLOB,
@@ -39,6 +41,7 @@ class IterMessagesAscendingTests(unittest.TestCase):
             )
             """
         )
+        conn.execute("CREATE INDEX chat_SORTSEQ ON chat(sort_seq)")
         return conn, db_path
 
     def test_default_get_messages_still_returns_newest_limit(self):
@@ -107,13 +110,13 @@ class IterMessagesAscendingTests(unittest.TestCase):
             # straddles the first batch boundary.
             for i in range(99):
                 conn.execute(
-                    "INSERT INTO chat VALUES (?, ?, ?, ?, ?)",
-                    (1, 1000.0 + i, f"m{i}", 0, 3),
+                    "INSERT INTO chat VALUES (?, ?, ?, ?, ?, ?)",
+                    (1000000 + i, 1, 1000.0 + i, f"m{i}", 0, 3),
                 )
             for j in range(5):
                 conn.execute(
-                    "INSERT INTO chat VALUES (?, ?, ?, ?, ?)",
-                    (1, 1099.0, f"dup{j}", 0, 3),
+                    "INSERT INTO chat VALUES (?, ?, ?, ?, ?, ?)",
+                    (1099000 + j, 1, 1099.0, f"dup{j}", 0, 3),
                 )
             conn.commit()
             conn.close()
@@ -141,8 +144,8 @@ class IterMessagesAscendingTests(unittest.TestCase):
             total = 250
             for i in range(total):
                 conn.execute(
-                    "INSERT INTO chat VALUES (?, ?, ?, ?, ?)",
-                    (1, 1234.0, f"same-{i}", 0, 3),
+                    "INSERT INTO chat VALUES (?, ?, ?, ?, ?, ?)",
+                    (1234000 + i, 1, 1234.0, f"same-{i}", 0, 3),
                 )
             conn.commit()
             conn.close()

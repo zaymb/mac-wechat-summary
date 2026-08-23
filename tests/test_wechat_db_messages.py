@@ -51,6 +51,7 @@ class FileMessageTests(unittest.TestCase):
             conn.execute(
                 """
                 CREATE TABLE chat (
+                    sort_seq INTEGER,
                     local_type INTEGER,
                     create_time REAL,
                     message_content BLOB,
@@ -59,6 +60,7 @@ class FileMessageTests(unittest.TestCase):
                 )
                 """
             )
+            conn.execute("CREATE INDEX chat_SORTSEQ ON chat(sort_seq)")
             payload = """
             wxid_sender:
             <msg><appmsg>
@@ -72,12 +74,12 @@ class FileMessageTests(unittest.TestCase):
             </appmsg></msg>
             """.strip().replace("wxid_sender:\n            ", "wxid_sender:\n")
             conn.execute(
-                "INSERT INTO chat VALUES (?, ?, ?, ?, ?)",
-                (49, 100.0, payload, 0, 3),
+                "INSERT INTO chat VALUES (?, ?, ?, ?, ?, ?)",
+                (100000, 49, 100.0, payload, 0, 3),
             )
             conn.execute(
-                "INSERT INTO chat VALUES (?, ?, ?, ?, ?)",
-                (1, 101.0, "plain text", 0, 3),
+                "INSERT INTO chat VALUES (?, ?, ?, ?, ?, ?)",
+                (101000, 1, 101.0, "plain text", 0, 3),
             )
             conn.commit()
             conn.close()
@@ -138,6 +140,7 @@ class MessageBoundsTests(unittest.TestCase):
             conn.execute(
                 """
                 CREATE TABLE chat (
+                    sort_seq INTEGER,
                     local_type INTEGER,
                     create_time REAL,
                     message_content BLOB,
@@ -146,10 +149,11 @@ class MessageBoundsTests(unittest.TestCase):
                 )
                 """
             )
+            conn.execute("CREATE INDEX chat_SORTSEQ ON chat(sort_seq)")
             for ts in (100.0, 101.0, 102.0):
                 conn.execute(
-                    "INSERT INTO chat VALUES (?, ?, ?, ?, ?)",
-                    (1, ts, f"message-{ts}", 0, 3),
+                    "INSERT INTO chat VALUES (?, ?, ?, ?, ?, ?)",
+                    (int(ts * 1000), 1, ts, f"message-{ts}", 0, 3),
                 )
             conn.commit()
             conn.close()
