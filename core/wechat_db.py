@@ -4,6 +4,7 @@ Based on the query logic from the wechat-decrypt project's mcp_server.py.
 """
 import html
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -579,6 +580,95 @@ class WeChatDB:
         all_rows.sort(key=lambda r: r[1])  # r[1] = create_time
         rows = all_rows[-limit:]
 
+        return self._messages_from_rows(rows, username, "chatroom" in username)
+
+    def _iter_msg_rows_ascending_shard(self, table_name, rel_key, after_ts,
+                                       until_ts, batch_size):
+        """Stream one message shard by the stable (timestamp, rowid) key."""
+        conn = self._open_encrypted_conn(rel_key)
+        if not conn:
+            raise RuntimeError(f"cannot open message shard: {rel_key}")
+        cursor_ts = float(after_ts)
+        cursor_rowid = None
+        try:
+            while True:
+                if cursor_rowid is None:
+                    where = "create_time > ?"
+                    params = [cursor_ts]
+                else:
+                    where = (
+                        "(create_time > ? OR "
+                        "(create_time = ? AND rowid > ?))"
+                    )
+                    params = [cursor_ts, cursor_ts, cursor_rowid]
+                if until_ts is not None:
+                    where += " AND create_time <= ?"
+                    params.append(until_ts)
+                params.append(batch_size)
+                rows = conn.execute(f"""
+                    SELECT rowid, local_type, create_time, message_content,
+                           WCDB_CT_message_content, status
+                    FROM [{table_name}]
+                    WHERE {where}
+                    ORDER BY create_time ASC, rowid ASC
+                    LIMIT ?
+                """, params).fetchall()
+                if not rows:
+                    return
+                for row in rows:
+                    yield row[1:]
+                if len(rows) < batch_size:
+                    return
+                cursor_rowid = rows[-1][0]
+                cursor_ts = rows[-1][2]
+        finally:
+            conn.close()
+
+    def iter_messages_ascending(self, username, since_ts=0.0, until_ts=None,
+                                batch_size=1000):
+        """Yield oldest-first lists of messages in bounded batches.
+
+        Unlike get_messages(), which keeps only the newest ``limit`` rows and
+        silently drops anything older, this walks forward from ``since_ts``
+        so a caller with its own durable cursor can consume arbitrarily large
+        backlogs without gaps and without ever jumping past unwritten
+        messages. Each yielded batch contains at most ~batch_size entries;
+        rows sharing the boundary timestamp are always kept together in one
+        batch so pagination can never skip them.
+        """
+        self._load_contacts()
+        is_group = "@chatroom" in username
+
+        rel_keys, table_name = self._find_msg_table(username)
+        if not rel_keys:
+            return
+
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        streams = [
+            self._iter_msg_rows_ascending_shard(
+                table_name, rel_key, since_ts, until_ts, batch_size
+            )
+            for rel_key in rel_keys
+        ]
+        merged_rows = heapq.merge(*streams, key=lambda row: row[1])
+        while True:
+            batch = []
+            try:
+                for _ in range(batch_size):
+                    batch.append(next(merged_rows))
+            except StopIteration:
+                pass
+            if not batch:
+                return
+            messages = self._messages_from_rows(batch, username, is_group)
+            if messages:
+                yield messages
+            if len(batch) < batch_size:
+                return
+
+    def _messages_from_rows(self, rows, username, is_group):
+        """Convert raw DB rows into message dicts (shared by readers)."""
         # In private chat, label counterpart's messages with display name
         contact_name = ""
         if not is_group:

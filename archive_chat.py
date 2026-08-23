@@ -56,6 +56,25 @@ def _write_json_atomic(path: str, value: dict) -> None:
             os.unlink(temp_path)
 
 
+def _write_text_atomic(path: str, body: str, mode: int = 0o644) -> None:
+    """Replace a text file only after its complete contents are durable."""
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", dir=parent
+    )
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
 def _read_recovery_descriptor(path: str) -> dict:
     with open(path, encoding="utf-8") as handle:
         value = json.load(handle)
@@ -128,7 +147,10 @@ def fmt(ts: float, pattern: str) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--chat", default="可爱小克")
-    ap.add_argument("--limit", type=int, default=10000)
+    ap.add_argument("--limit", type=int, default=10000,
+                    help="maximum rows consumed per oldest-first chunk; "
+                         "the archive loop keeps chunking until the window "
+                         "is fully consumed, so this never truncates")
     ap.add_argument("--dry-run", action="store_true",
                     help="fetch + report label, but write nothing (no slice, no cursor)")
     ap.add_argument(
@@ -186,14 +208,16 @@ def main() -> int:
         print(f"archive-chat: chat not found: {args.chat}", file=sys.stderr)
         return 1
 
-    messages = db.get_messages(
+    messages = []
+    for chunk in db.iter_messages_ascending(
         username,
         since_ts=since_ts,
         until_ts=through_ts,
-        limit=args.limit,
-    )
-    # get_messages(since_ts) uses strict '>', matching digest cursor semantics.
-    # Filter out system messages same as the MCP read_messages does.
+        batch_size=max(args.limit, 1),
+    ):
+        messages.extend(chunk)
+    # iter_messages_ascending() uses strict '>', matching digest cursor
+    # semantics. Filter out system messages same as the MCP read_messages does.
     messages = [m for m in messages if m["type"] not in (10000, 10002)]
     if not messages:
         if args.dry_run:
@@ -262,8 +286,10 @@ def main() -> int:
         t = fmt(m["timestamp"], "%m-%d %H:%M")
         sender = m["sender"] or "?"
         lines.append(f"[{t}] {sender}: {m['text']}")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    # Write atomically with fsync + os.replace so a concurrent reader can
+    # never observe a partially written canonical slice.
+    body = "\n".join(lines) + "\n"
+    _write_text_atomic(path, body)
 
     save_cursor(args.chat, end_ts)
     descriptor.update(

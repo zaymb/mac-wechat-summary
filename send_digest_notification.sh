@@ -2,12 +2,19 @@
 set -euo pipefail
 umask 077
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=wechat_digest_lib.sh
+source "$SCRIPT_DIR/wechat_digest_lib.sh"
+
 SLICE_ID=""
 FILE_SUMMARY="${WECHAT_DIGEST_FILE_SUMMARY:-}"
 FILE_SUMMARY_EXPLICIT=0
 TOKEN_FILE="${WECHAT_DIGEST_TOKEN_FILE:-$HOME/.wechat-summary/digest-bot-token}"
 LEDGER="${WECHAT_DIGEST_NOTIFICATION_LEDGER:-$HOME/.wechat-summary/digest-notifications.jsonl}"
-CHAT_ID="${WECHAT_DIGEST_CHAT_ID:-8690704851}"
+CHAT_ID="$(private_runtime_value \
+  "${WECHAT_DIGEST_CHAT_ID:-}" \
+  "${WECHAT_DIGEST_CHAT_ID_FILE:-$HOME/.wechat-summary/digest-chat-id}" \
+  2>/dev/null || true)"
 CURL_BIN="${WECHAT_DIGEST_CURL_BIN:-curl}"
 PYTHON_BIN="${WECHAT_DIGEST_PYTHON_BIN:-python3}"
 FORMATTER="${WECHAT_DIGEST_FORMATTER:-$(dirname "$0")/digest_notification.py}"
@@ -33,6 +40,11 @@ done
 if [ -z "$SLICE_ID" ]; then
   printf '%s\n' '--slice-id is required' >&2
   exit 2
+fi
+
+if [ -z "$CHAT_ID" ]; then
+  printf '%s\n' 'digest chat ID is not configured; refusing to deliver anywhere (fail closed)' >&2
+  exit 1
 fi
 
 if [ "$FILE_SUMMARY_EXPLICIT" -eq 0 ] \

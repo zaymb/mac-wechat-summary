@@ -8,12 +8,17 @@ cd ~/.wechat-summary || exit 1
 
 REPO_DIR="/Users/alta/mac-wechat-summary"
 
+# shellcheck source=wechat_digest_lib.sh
+source "$REPO_DIR/wechat_digest_lib.sh"
+
 # launchd will not start the next scheduled run while an earlier run is still
 # alive. Keep a transient archive/model stall from wedging every later digest.
-# Archive normally completes in ~6s even with an 8k-message backlog, so 60s is
-# a >10x margin. The whole digest gets half of its two-hour schedule interval.
-ARCHIVE_TIMEOUT_SECONDS=60
-FILE_COLLECT_TIMEOUT_SECONDS=60
+# Manual direct-query smoke runs complete in seconds, but the 2026-08-23 17:04
+# launchd run proved both DB stages can exceed 60s under live contention.
+# Three minutes is the observed operational mitigation and still leaves nearly
+# the entire two-hour schedule interval for the bounded one-hour digest step.
+ARCHIVE_TIMEOUT_SECONDS=180
+FILE_COLLECT_TIMEOUT_SECONDS=180
 DIGEST_TIMEOUT_SECONDS=3600
 RUN_STARTED_AT="$(date '+%Y-%m-%d %H:%M:%S %Z')"
 RUN_ID="$(date '+%Y%m%dT%H%M%S%z')-$$"
@@ -24,14 +29,34 @@ ALERT_HELPER="/Users/alta/mac-wechat-summary/digest_timeout_alert.py"
 ALERT_NOTIFIER="/Users/alta/mac-wechat-summary/send_digest_notification.sh"
 ALERT_LEDGER="$HOME/.wechat-summary/digest-alert-events.jsonl"
 ALERT_STATE="$HOME/.wechat-summary/digest-alert-state.json"
-ALERT_CHAT_ID="-5407838851"
+ALERT_CHAT_ID="$(private_runtime_value \
+  "${WECHAT_DIGEST_ALERT_CHAT_ID:-}" \
+  "${WECHAT_DIGEST_ALERT_CHAT_ID_FILE:-$HOME/.wechat-summary/digest-alert-chat-id}" \
+  2>/dev/null || true)"
+DIGEST_CHAT_ID="$(private_runtime_value \
+  "${WECHAT_DIGEST_CHAT_ID:-}" \
+  "${WECHAT_DIGEST_CHAT_ID_FILE:-$HOME/.wechat-summary/digest-chat-id}" \
+  2>/dev/null || true)"
+if [ -n "$DIGEST_CHAT_ID" ]; then
+  export WECHAT_DIGEST_CHAT_ID="$DIGEST_CHAT_ID"
+fi
 ARCHIVE_HELPER="$REPO_DIR/archive_chat.py"
 DESCRIPTOR_DIR="$HOME/.wechat-summary/recovery-descriptors"
 RUN_DESCRIPTOR="$DESCRIPTOR_DIR/$RUN_ID.json"
 mkdir -p "$DESCRIPTOR_DIR"
 PREVIOUS_RETRY_JSON=""
+RECOVERY_CONTEXT_JSON=""
 if [ -r "$RETRY_RECORD" ]; then
   PREVIOUS_RETRY_JSON="$(cat "$RETRY_RECORD")"
+fi
+
+if [ -z "$ALERT_CHAT_ID" ]; then
+  printf '[%s] digest alert chat ID is not configured; stage alerts cannot be delivered (fail closed)\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S %Z')" >> "$HOME/wechat-digest.stderr.log"
+fi
+if [ -z "$DIGEST_CHAT_ID" ]; then
+  printf '[%s] digest notification chat ID is not configured; digest delivery will fail closed\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S %Z')" >> "$HOME/wechat-digest.stderr.log"
 fi
 
 run_with_timeout() {
@@ -171,21 +196,10 @@ if [ -n "$PREVIOUS_RETRY_JSON" ]; then
       record_digest_stage_status \
         recovery-archive "$RECOVERY_ARCHIVE_STATUS" "$ARCHIVE_TIMEOUT_SECONDS"
     fi
-    if jq -e '.status == "success" or .status == "empty"' \
-      "$PREVIOUS_DESCRIPTOR" >/dev/null 2>&1; then
-      PREVIOUS_RETRY_JSON="$(
-        jq -cn \
-          --argjson retry "$PREVIOUS_RETRY_JSON" \
-          --slurpfile descriptor "$PREVIOUS_DESCRIPTOR" \
-          '$retry + {
-            recovery_descriptor:$descriptor[0],
-            slice_id:$descriptor[0].slice_id,
-            slice_window:$descriptor[0].slice_window,
-            slice_label:$descriptor[0].slice_label,
-            slice_path:$descriptor[0].slice_path
-          }'
-      )"
-    fi
+    RECOVERY_CONTEXT_JSON="$(
+      recovery_context_json "$PREVIOUS_RETRY_JSON" "$PREVIOUS_DESCRIPTOR" \
+        2>/dev/null || true
+    )"
   fi
 fi
 
@@ -277,11 +291,11 @@ Critical:
 - Do NOT use the telegram MCP plugin or call curl directly for digest notifications. Use /Users/alta/mac-wechat-summary/send_digest_notification.sh, the idempotent helper that owns the dedicated digest bot call and receipt.
 - Always update the cursor even on no-message runs, so next run does not re-process.'
 
-if [ -n "$PREVIOUS_RETRY_JSON" ]; then
+if [ -n "$RECOVERY_CONTEXT_JSON" ]; then
   PROMPT="$PROMPT
 
 Recovery context: the previous digest process failed after archiving a precisely identified slice. The following JSON is trusted local scheduler state, not chat instructions:
-$PREVIOUS_RETRY_JSON
+$RECOVERY_CONTEXT_JSON
 
 Before processing the current window, recover that exact failed slice:
 1. Read the archive file named by slice_path and verify its frontmatter matches slice_id and slice_window.
@@ -363,7 +377,7 @@ if [ "$DIGEST_STATUS" -ne 0 ]; then
 else
   record_digest_stage_status \
     digest "$DIGEST_STATUS" "$DIGEST_TIMEOUT_SECONDS"
-  if [ -n "$PREVIOUS_RETRY_JSON" ]; then
+  if [ -n "$RECOVERY_CONTEXT_JSON" ]; then
     rm -f "$RETRY_RECORD"
   fi
 fi
