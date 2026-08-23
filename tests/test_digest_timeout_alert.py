@@ -42,6 +42,7 @@ class DigestTimeoutAlertTests(unittest.TestCase):
             status=status,
             occurred_at=kwargs.pop("occurred_at", "2026-08-22T19:05:07+10:00"),
             timeout_seconds=60 if status == "timeout" else None,
+            exit_code=kwargs.pop("exit_code", 7) if status == "error" else None,
             notifier=kwargs.pop("notifier", None),
             chat_id=kwargs.pop("chat_id", "test-family-channel"),
             **kwargs,
@@ -154,6 +155,33 @@ class DigestTimeoutAlertTests(unittest.TestCase):
         self.assertEqual([r["status"] for r in pipeline], ["empty", "silent"])
         self.assertTrue(all(r["timeout_seconds"] is None for r in pipeline))
         self.assertFalse(self.notify_log.exists())
+
+    def test_ordinary_error_is_receipted_and_alerted(self):
+        notifier = self._notifier()
+
+        failed = self._event(
+            "round-error", status="error", exit_code=23, notifier=notifier
+        )
+
+        self.assertEqual(failed["notification"], "sent")
+        pipeline = [r for r in self._rows() if r["record_type"] == "pipeline_status"]
+        self.assertEqual(pipeline[0]["status"], "error")
+        self.assertEqual(pipeline[0]["exit_code"], 23)
+        delivered = json.loads(
+            self.notify_log.read_text(encoding="utf-8").splitlines()[0]
+        )
+        self.assertIn("error exit=23", delivered["text"])
+
+    def test_error_streak_resets_after_success(self):
+        notifier = self._notifier()
+        self._event("round-error", status="error", notifier=notifier)
+        self._event("round-success", status="success", notifier=notifier)
+        later = self._event("round-error-2", status="error", notifier=notifier)
+
+        self.assertEqual(later["notification"], "sent")
+        self.assertEqual(
+            len(self.notify_log.read_text(encoding="utf-8").splitlines()), 2
+        )
 
 
 if __name__ == "__main__":

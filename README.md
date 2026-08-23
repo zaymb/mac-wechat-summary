@@ -78,6 +78,11 @@ macOS 菜单栏应用，一键总结微信群聊消息。
 │   └── find_keys_macos.c # 内存扫描 C 程序（运行时自动编译）
 ├── resources/            # 菜单栏图标资源
 ├── mcp_server.py        # MCP Server（供 AI Agent 调用）
+├── wechat_digest.sh     # 定时 digest 的版本化编排脚本（部署副本在 ~/wechat-digest.sh）
+├── archive_chat.py      # 原始消息分片与精确失败恢复
+├── collect_chat_files.py # 群文件增量收集
+├── digest_timeout_alert.py # 全阶段状态台账与失败告警
+├── send_digest_notification.sh # 带幂等回执的 Telegram 通知
 ├── 启动.command          # 一键启动脚本（双击即可运行）
 ├── setup.py             # py2app 打包配置（可选）
 ├── requirements.txt     # Python 依赖

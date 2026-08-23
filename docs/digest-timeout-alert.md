@@ -1,4 +1,4 @@
-# Digest timeout alert
+# Digest pipeline status and failure alert
 
 `digest_timeout_alert.py` records scheduler-observed stage outcomes without
 reading chat content or credentials.  It is intentionally separate from the
@@ -6,11 +6,11 @@ active machine scheduler: code review and deployment can happen independently.
 
 ## Contract
 
-- `timeout` is distinct from the ordinary healthy outcomes `success`, `empty`,
-  and `silent`.
-- Every distinct timeout round is appended to a mode-0600 JSONL ledger.
-- The first timeout in an uninterrupted per-stage streak notifies the shared
-  resident channel.  Later rounds remain durable but are notification-suppressed
+- `timeout` and nonzero `error` are distinct from the ordinary healthy outcomes
+  `success`, `empty`, and `silent`.
+- Every stage outcome is appended to a mode-0600 JSONL ledger.
+- The first failure in an uninterrupted per-stage streak notifies the shared
+  resident channel. Later rounds remain durable but are notification-suppressed
   until any healthy outcome resets the streak.
 - The caller supplies the timeout that actually fired.  This helper has no
   timeout default and does not change the scheduler's existing timeout budget.
@@ -25,11 +25,11 @@ keep its value in private runtime configuration, not in git.
 
 ## Active rollout hook
 
-The active scheduler is currently an untracked machine-local wrapper at
-`~/wechat-digest.sh`; there is no canonical tracked copy in this repository.
-It calls the helper immediately after the archive and file-collector stages
-return.  For a timeout, it passes the same timeout variable already used by
-that stage:
+The canonical scheduler wrapper is tracked as `wechat_digest.sh`. The deployed
+machine-local copy at `~/wechat-digest.sh` must remain byte-identical. It calls
+the helper immediately after the archive, file-collector, and digest stages
+return. For a timeout, it passes the same timeout variable already used by that
+stage; for another nonzero exit it passes `--status error --exit-code N`.
 
 ```sh
 python3 /path/to/mac-wechat-summary/digest_timeout_alert.py \
@@ -68,3 +68,9 @@ labelled shared-channel test.  A valid live
 receipt consists of: one `pipeline_status` row, one successful
 `notification_delivery` row, and the sender's external message receipt.  No
 additional live notification is needed for ordinary code-only regression tests.
+
+Archive recovery is driven by the durable descriptor written before database
+access. The descriptor fixes the exclusive lower cursor and inclusive run
+cutoff even if the archive process is killed. A failed digest may only write a
+retry record when that descriptor is valid; the next run reconstructs the
+bounded slice before asking the model to recover it.

@@ -506,12 +506,13 @@ class WeChatDB:
                 conn.close()
         return total
 
-    def get_messages(self, username, since_ts=0, limit=500):
+    def get_messages(self, username, since_ts=0, until_ts=None, limit=500):
         """Get group/private chat messages.
 
         Args:
             username: Username or group chat ID (xxx@chatroom).
             since_ts: Start timestamp (only get messages after this time).
+            until_ts: Optional inclusive upper timestamp for bounded recovery.
             limit: Maximum number of messages.
 
         Returns:
@@ -530,7 +531,16 @@ class WeChatDB:
             if not conn:
                 continue
             try:
-                if since_ts > 0:
+                if since_ts > 0 and until_ts is not None:
+                    rows = conn.execute(f"""
+                        SELECT local_type, create_time, message_content,
+                               WCDB_CT_message_content, status
+                        FROM [{table_name}]
+                        WHERE create_time > ? AND create_time <= ?
+                        ORDER BY create_time DESC
+                        LIMIT ?
+                    """, (since_ts, until_ts, limit * 2)).fetchall()
+                elif since_ts > 0:
                     rows = conn.execute(f"""
                         SELECT local_type, create_time, message_content,
                                WCDB_CT_message_content, status
@@ -539,6 +549,15 @@ class WeChatDB:
                         ORDER BY create_time DESC
                         LIMIT ?
                     """, (since_ts, limit * 2)).fetchall()
+                elif until_ts is not None:
+                    rows = conn.execute(f"""
+                        SELECT local_type, create_time, message_content,
+                               WCDB_CT_message_content, status
+                        FROM [{table_name}]
+                        WHERE create_time <= ?
+                        ORDER BY create_time DESC
+                        LIMIT ?
+                    """, (until_ts, limit)).fetchall()
                 else:
                     rows = conn.execute(f"""
                         SELECT local_type, create_time, message_content,

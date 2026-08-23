@@ -22,9 +22,10 @@ import sys
 import tempfile
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 HEALTHY_STATUSES = frozenset({"success", "empty", "silent"})
-VALID_STATUSES = frozenset({"timeout", *HEALTHY_STATUSES})
+FAILURE_STATUSES = frozenset({"timeout", "error"})
+VALID_STATUSES = frozenset({*FAILURE_STATUSES, *HEALTHY_STATUSES})
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.:+-]{1,128}$")
 _SAFE_STAGE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -33,7 +34,9 @@ class AlertError(RuntimeError):
     """Raised when a receipt cannot be recorded without guessing."""
 
 
-def _validate_inputs(run_id, stage, status, occurred_at, timeout_seconds):
+def _validate_inputs(
+    run_id, stage, status, occurred_at, timeout_seconds, exit_code
+):
     if not _SAFE_ID.fullmatch(run_id):
         raise AlertError("run_id must be a short, non-sensitive identifier")
     if not _SAFE_STAGE.fullmatch(stage):
@@ -51,6 +54,11 @@ def _validate_inputs(run_id, stage, status, occurred_at, timeout_seconds):
             )
     elif timeout_seconds is not None:
         raise AlertError("timeout_seconds is only valid for timeout events")
+    if status == "error":
+        if exit_code is None or exit_code == 0:
+            raise AlertError("exit_code must be non-zero for error events")
+    elif exit_code is not None:
+        raise AlertError("exit_code is only valid for error events")
 
 
 def _event_id(run_id, stage, status):
@@ -140,7 +148,7 @@ def _project_state(rows):
                 },
             )
             event_stage[event_id] = stage
-            if status == "timeout":
+            if status in FAILURE_STATUSES:
                 if stage_state["active_timeout"]:
                     stage_state["streak"] += 1
                 else:
@@ -189,10 +197,13 @@ def _exclusive_lock(state_path):
 
 
 def _notification_message(event):
+    if event["status"] == "timeout":
+        detail = f"timeout after {event['timeout_seconds']}s"
+    else:
+        detail = f"error exit={event['exit_code']}"
     return (
-        "WeChat digest timeout: "
-        f"stage={event['stage']}, run={event['run_id']}, "
-        f"limit={event['timeout_seconds']}s. "
+        "WeChat digest pipeline failure: "
+        f"stage={event['stage']}, run={event['run_id']}, {detail}. "
         "A durable failure receipt was recorded for the resident agents."
     )
 
@@ -264,6 +275,7 @@ def process_event(
     status,
     occurred_at,
     timeout_seconds=None,
+    exit_code=None,
     notifier=None,
     chat_id=None,
 ):
@@ -276,7 +288,9 @@ def process_event(
     """
     ledger_path = Path(ledger_path)
     state_path = Path(state_path)
-    _validate_inputs(run_id, stage, status, occurred_at, timeout_seconds)
+    _validate_inputs(
+        run_id, stage, status, occurred_at, timeout_seconds, exit_code
+    )
     event_id = _event_id(run_id, stage, status)
 
     with _exclusive_lock(state_path):
@@ -298,7 +312,7 @@ def process_event(
 
         if existing:
             retryable = (
-                status == "timeout"
+                status in FAILURE_STATUSES
                 and stage_state.get("active_timeout")
                 and event_id in active_events.get(stage, set())
                 and not stage_state.get("alert_delivered")
@@ -320,7 +334,7 @@ def process_event(
                 "retry": True,
             }
 
-        if status == "timeout":
+        if status in FAILURE_STATUSES:
             continuing = bool(stage_state.get("active_timeout"))
             streak = int(stage_state.get("streak") or 0) + 1 if continuing else 1
             should_notify = not continuing or not stage_state.get("alert_delivered")
@@ -351,6 +365,7 @@ def process_event(
             "status": status,
             "occurred_at": occurred_at,
             "timeout_seconds": timeout_seconds,
+            "exit_code": exit_code,
             "timeout_streak": streak,
             "notification_disposition": disposition,
         }
@@ -392,6 +407,7 @@ def main(argv=None):
     parser.add_argument("--status", required=True, choices=sorted(VALID_STATUSES))
     parser.add_argument("--occurred-at", default=_now_iso())
     parser.add_argument("--timeout-seconds", type=int)
+    parser.add_argument("--exit-code", type=int)
     parser.add_argument(
         "--notifier",
         default=os.environ.get("WECHAT_DIGEST_ALERT_NOTIFIER"),
@@ -411,6 +427,7 @@ def main(argv=None):
             status=args.status,
             occurred_at=args.occurred_at,
             timeout_seconds=args.timeout_seconds,
+            exit_code=args.exit_code,
             notifier=args.notifier,
             chat_id=args.chat_id,
         )
