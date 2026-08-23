@@ -247,7 +247,11 @@ class WeChatDB:
         Falls back to the old decrypt-to-file path when pysqlcipher3 is unavailable.
         Returns a sqlite3-compatible connection or None.
         """
-        db_path = os.path.join(self.db_dir, rel_path)
+        db_path = (
+            rel_path
+            if os.path.isabs(rel_path)
+            else os.path.join(self.db_dir, rel_path)
+        )
         if not os.path.exists(db_path):
             return None
         if self._is_plain_sqlite(db_path):
@@ -708,14 +712,16 @@ class WeChatDB:
         """
         self._load_contacts()
         is_group = "@chatroom" in username
-        db_paths, table_name = self._find_msg_table(username)
-        if not db_paths:
+        rel_keys, table_name = self._find_msg_table(username)
+        if not rel_keys:
             result = ([], since_ts) if include_scan_watermark else []
             return result
 
         all_rows = []
-        for db_path in db_paths:
-            conn = sqlite3.connect(db_path)
+        for rel_key in rel_keys:
+            conn = self._open_encrypted_conn(rel_key)
+            if not conn:
+                continue
             try:
                 rows = conn.execute(
                     f"""
@@ -979,9 +985,9 @@ class WeChatDB:
         total = len(usernames)
         print(f"[search] 正在定位 {total} 个群聊的消息表...")
         for i, username in enumerate(usernames):
-            db_paths, table_name = self._find_msg_table(username)
-            if db_paths:
-                table_cache[username] = (db_paths, table_name)
+            rel_keys, table_name = self._find_msg_table(username)
+            if rel_keys:
+                table_cache[username] = (rel_keys, table_name)
         print(f"[search] 定位完成，{len(table_cache)}/{total} 个群有消息表")
 
         keywords_lower = [kw.lower() for kw in keywords]
@@ -989,13 +995,15 @@ class WeChatDB:
         for i, username in enumerate(table_cache):
             is_group = "@chatroom" in username
             group_name = self._contacts.get(username, username)
-            db_paths, table_name = table_cache[username]
+            rel_keys, table_name = table_cache[username]
 
             print(f"[search]   ({i+1}/{len(table_cache)}) 搜索 {group_name}...")
 
             rows = []
-            for db_path in db_paths:
-                conn = sqlite3.connect(db_path)
+            for rel_key in rel_keys:
+                conn = self._open_encrypted_conn(rel_key)
+                if not conn:
+                    continue
                 try:
                     r = conn.execute(f"""
                         SELECT local_type, create_time, message_content,
@@ -1350,13 +1358,15 @@ class WeChatDB:
         self._load_contacts()
         is_group = "@chatroom" in username
 
-        db_paths, table_name = self._find_msg_table(username)
-        if not db_paths:
+        rel_keys, table_name = self._find_msg_table(username)
+        if not rel_keys:
             return []
 
         rows = []
-        for db_path in db_paths:
-            conn = sqlite3.connect(db_path)
+        for rel_key in rel_keys:
+            conn = self._open_encrypted_conn(rel_key)
+            if not conn:
+                continue
             try:
                 if since_ts > 0:
                     r = conn.execute(f"""
@@ -1463,13 +1473,15 @@ class WeChatDB:
         self._load_contacts()
         is_group = "@chatroom" in username
 
-        db_paths, table_name = self._find_msg_table(username)
-        if not db_paths:
+        rel_keys, table_name = self._find_msg_table(username)
+        if not rel_keys:
             return []
 
         rows = []
-        for db_path in db_paths:
-            conn = sqlite3.connect(db_path)
+        for rel_key in rel_keys:
+            conn = self._open_encrypted_conn(rel_key)
+            if not conn:
+                continue
             try:
                 if since_ts > 0:
                     r = conn.execute(f"""
