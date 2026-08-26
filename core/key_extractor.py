@@ -4,6 +4,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 
 from .config import APP_DIR, DATA_DIR, load_config
 
@@ -131,12 +132,16 @@ def extract_keys():
     home_dir = os.path.expanduser("~")
     db_dir = load_config().get("db_dir", "")
 
-    # C scanner outputs all_keys.json to cwd, so cd to DATA_DIR
+    # The C scanner always writes all_keys.json to its cwd. Run it in an
+    # isolated staging directory so a failed/empty scan cannot overwrite the
+    # last known-good key cache.
+    scan_tmp = tempfile.TemporaryDirectory(prefix=".key-scan-", dir=DATA_DIR)
+    scan_dir = scan_tmp.name
     try:
         result = subprocess.run(
             ["sudo", "-n", C_BINARY, str(pid), home_dir, db_dir],
             capture_output=True, text=True,
-            cwd=DATA_DIR,
+            cwd=scan_dir,
             timeout=60,
         )
         with open(EXTRACT_LOG, "w", encoding="utf-8") as f:
@@ -148,7 +153,7 @@ def extract_keys():
         if result.returncode != 0:
             # Try interactive sudo via osascript dialog
             shell_command = (
-                f"cd {shlex.quote(DATA_DIR)} && "
+                f"cd {shlex.quote(scan_dir)} && "
                 f"{shlex.quote(C_BINARY)} {pid} {shlex.quote(home_dir)} {shlex.quote(db_dir)}"
             )
             result = subprocess.run(
@@ -165,30 +170,34 @@ def extract_keys():
             if result.returncode != 0:
                 return None
 
+        # Read staged output, never the live cache.
+        keys_path = os.path.join(scan_dir, "all_keys.json")
+        if not os.path.exists(keys_path):
+            return None
+
+        try:
+            with open(keys_path) as f:
+                keys = json.load(f)
+            keys = {k: v for k, v in keys.items() if not k.startswith("_")}
+        except (json.JSONDecodeError, OSError):
+            return None
+
+        # If C scanner couldn't match DBs due to permission issues, re-match in
+        # Python. Python runs as the current user and can read sandbox files.
+        if not keys and db_dir and os.path.isdir(db_dir):
+            keys = _rematch_keys_from_log(db_dir, save=False)
+
+        if not keys:
+            return None
+
+        _save_keys_atomically(keys)
+        return keys
     except subprocess.TimeoutExpired:
         return None
     except Exception:
         return None
-
-    # Read output keys file
-    keys_path = os.path.join(DATA_DIR, "all_keys.json")
-    if not os.path.exists(keys_path):
-        return None
-
-    try:
-        with open(keys_path) as f:
-            keys = json.load(f)
-        # Filter out metadata fields
-        keys = {k: v for k, v in keys.items() if not k.startswith("_")}
-    except (json.JSONDecodeError, OSError):
-        return None
-
-    # If C scanner couldn't match DBs due to permission issues, re-match in Python
-    # Python runs as current user and can read sandbox files
-    if not keys and db_dir and os.path.isdir(db_dir):
-        keys = _rematch_keys_from_log(db_dir)
-
-    return keys if keys else None
+    finally:
+        scan_tmp.cleanup()
 
 
 def _parse_raw_keys_from_log(log_path=EXTRACT_LOG):
@@ -219,7 +228,21 @@ def _parse_raw_keys_from_log(log_path=EXTRACT_LOG):
     return raw_keys
 
 
-def _rematch_keys_from_log(db_dir):
+def _save_keys_atomically(keys):
+    """Replace the live key cache only after a non-empty result is ready."""
+    fd, tmp_path = tempfile.mkstemp(prefix=".all_keys.", suffix=".tmp", dir=DATA_DIR)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(keys, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, KEYS_FILE)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _rematch_keys_from_log(db_dir, save=True):
     """Read db file headers with Python (user privileges) and match against key+salt from scanner log.
 
     Solves the issue where root cannot read macOS sandbox files.
@@ -258,14 +281,10 @@ def _rematch_keys_from_log(db_dir):
             except OSError:
                 continue
 
-    if matched:
+    if matched and save:
         # Save to all_keys.json
-        try:
-            with open(KEYS_FILE, "w") as f:
-                json.dump(matched, f, indent=2)
-            print(f"[key_extractor] Python 重新匹配成功: {len(matched)} 个数据库")
-        except OSError:
-            pass
+        _save_keys_atomically(matched)
+        print(f"[key_extractor] Python 重新匹配成功: {len(matched)} 个数据库")
 
     return matched
 
