@@ -30,6 +30,11 @@ def _run_scan(tmp_path, staged_keys):
         ),
         mock.patch.object(key_extractor.subprocess, "run", side_effect=fake_run),
         mock.patch.object(key_extractor, "_rematch_keys_from_log", return_value={}),
+        mock.patch.object(
+            key_extractor,
+            "_validated_staged_keys",
+            side_effect=lambda keys, _db_dir: keys,
+        ),
     ):
         result = key_extractor.extract_keys()
 
@@ -49,3 +54,37 @@ def test_non_empty_scan_atomically_replaces_key_cache(tmp_path):
 
     assert result == new
     assert live == new
+
+
+def test_staged_key_requires_page1_authentication(tmp_path):
+    db_dir = tmp_path / "db_storage"
+    db_path = db_dir / "message" / "message_2.db"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_bytes(b"x" * 4096)
+    staged = {"message/message_2.db": {"enc_key": "ab" * 32}}
+
+    with mock.patch.object(key_extractor, "verify_page1", return_value=False):
+        assert key_extractor._validated_staged_keys(staged, str(db_dir)) == {}
+
+    with mock.patch.object(key_extractor, "verify_page1", return_value=True):
+        assert key_extractor._validated_staged_keys(staged, str(db_dir)) == staged
+
+
+def test_staged_key_cannot_escape_database_root(tmp_path):
+    db_dir = tmp_path / "db_storage"
+    db_dir.mkdir()
+    outside = tmp_path / "outside.db"
+    outside.write_bytes(b"x" * 4096)
+    staged = {"../outside.db": {"enc_key": "ab" * 32}}
+
+    with mock.patch.object(key_extractor, "verify_page1", return_value=True):
+        assert key_extractor._validated_staged_keys(staged, str(db_dir)) == {}
+
+
+def test_extract_log_is_private(tmp_path):
+    log_path = tmp_path / "extract.log"
+    with mock.patch.object(key_extractor, "EXTRACT_LOG", str(log_path)):
+        key_extractor._write_extract_log("safe diagnostics\n")
+
+    assert log_path.read_text(encoding="utf-8") == "safe diagnostics\n"
+    assert log_path.stat().st_mode & 0o777 == 0o600

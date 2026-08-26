@@ -7,6 +7,7 @@ import sys
 import tempfile
 
 from .config import APP_DIR, DATA_DIR, load_config
+from .decryptor import verify_page1
 
 
 C_SOURCE = os.path.join(APP_DIR, "c_src", "find_keys_macos.c")
@@ -117,6 +118,54 @@ def compile_scanner():
         return False
 
 
+def _write_extract_log(text, append=False):
+    """Write scanner diagnostics without leaving a world-readable log."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
+    fd = os.open(EXTRACT_LOG, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def _validated_staged_keys(keys, db_dir):
+    """Keep only candidates that cryptographically authenticate page 1."""
+    if not isinstance(keys, dict) or not db_dir or not os.path.isdir(db_dir):
+        return {}
+
+    root = os.path.realpath(db_dir)
+    validated = {}
+    for rel_path, record in keys.items():
+        if not isinstance(rel_path, str) or not isinstance(record, dict):
+            continue
+        key_hex = record.get("enc_key")
+        if not isinstance(key_hex, str) or len(key_hex) != 64:
+            continue
+        try:
+            key = bytes.fromhex(key_hex)
+        except ValueError:
+            continue
+
+        normalized = rel_path.replace("\\", "/").lstrip("/")
+        path = os.path.realpath(os.path.join(root, normalized))
+        try:
+            if os.path.commonpath((root, path)) != root:
+                continue
+            with open(path, "rb") as f:
+                page1 = f.read(4096)
+        except (OSError, ValueError):
+            continue
+        if len(page1) == 4096 and verify_page1(key, page1):
+            validated[normalized] = {"enc_key": key_hex.lower()}
+    return validated
+
+
 def extract_keys():
     """Run C scanner to extract keys, requires sudo.
 
@@ -144,11 +193,12 @@ def extract_keys():
             cwd=scan_dir,
             timeout=60,
         )
-        with open(EXTRACT_LOG, "w", encoding="utf-8") as f:
-            f.write("=== sudo -n stdout ===\n")
-            f.write(result.stdout)
-            f.write("\n=== sudo -n stderr ===\n")
-            f.write(result.stderr)
+        _write_extract_log(
+            "=== sudo -n stdout ===\n"
+            + result.stdout
+            + "\n=== sudo -n stderr ===\n"
+            + result.stderr
+        )
 
         if result.returncode != 0:
             # Try interactive sudo via osascript dialog
@@ -162,11 +212,13 @@ def extract_keys():
                 capture_output=True, text=True,
                 timeout=60,
             )
-            with open(EXTRACT_LOG, "a", encoding="utf-8") as f:
-                f.write("\n=== osascript stdout ===\n")
-                f.write(result.stdout)
-                f.write("\n=== osascript stderr ===\n")
-                f.write(result.stderr)
+            _write_extract_log(
+                "\n=== osascript stdout ===\n"
+                + result.stdout
+                + "\n=== osascript stderr ===\n"
+                + result.stderr,
+                append=True,
+            )
             if result.returncode != 0:
                 return None
 
@@ -187,6 +239,7 @@ def extract_keys():
         if not keys and db_dir and os.path.isdir(db_dir):
             keys = _rematch_keys_from_log(db_dir, save=False)
 
+        keys = _validated_staged_keys(keys, db_dir)
         if not keys:
             return None
 
