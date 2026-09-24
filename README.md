@@ -53,6 +53,16 @@ macOS 菜单栏应用，一键总结微信群聊消息。
 3. 菜单栏出现 <img src="resources/icon.png" width="16" height="16"> 图标后，点击设置 API Key
 4. 选择群聊 → 总结新消息
 
+微信更新后如果菜单显示没有数据库密钥，先正常退出微信，再在仓库目录运行一次：
+
+```bash
+sudo /usr/sbin/DevToolsSecurity -enable
+python3 bootstrap_wechat_keys.py --acknowledge-debug-copy
+sudo /usr/sbin/DevToolsSecurity -disable
+```
+
+取钥期间需要 macOS Developer Mode；最后一条命令恢复原设置。脚本只对私有临时副本做 ad-hoc 签名，通过 LLDB 捕获并验证逐库密钥，完成后会关闭副本并重新打开未改动的原版微信。临时微信窗口要求登录时，在窗口中进入当前账号；密钥不会打印到终端。
+
 详细说明见 [使用说明.txt](使用说明.txt) 和 [功能说明.txt](功能说明.txt)。
 
 ## 项目结构
@@ -114,6 +124,7 @@ macOS 菜单栏应用，一键总结微信群聊消息。
 ## 致谢
 
 - [ylytdeng/wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt) — 微信数据库解密方案参考，本项目在此基础上进行了改进和扩展
+- [acmerfight/macOS WeChat 4.x local toolkit](https://gist.github.com/acmerfight/0a01249ef72970d07a2603dbb629e80f) — 临时副本与 LLDB PBKDF2 取钥流程参考
 - [Sue](https://github.com/smoonsue) — 测试与反馈
 
 ## License

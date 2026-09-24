@@ -1,9 +1,13 @@
+import hashlib
+import hmac
 import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from core import key_extractor
+from core import lldb_key_capture
+from core.decryptor import PAGE_SZ, RESERVE_SZ, SALT_SZ
 
 
 def _run_scan(tmp_path, staged_keys):
@@ -70,6 +74,14 @@ def test_staged_key_requires_page1_authentication(tmp_path):
         assert key_extractor._validated_staged_keys(staged, str(db_dir)) == staged
 
 
+def test_candidate_rejects_decrypted_header_without_page_authentication():
+    key = bytes(range(32))
+    page1 = bytes(range(256)) * (PAGE_SZ // 256)
+
+    with mock.patch.object(key_extractor, "verify_page1", return_value=False):
+        assert not key_extractor._candidate_validates_page1(key, page1)
+
+
 def test_staged_key_cannot_escape_database_root(tmp_path):
     db_dir = tmp_path / "db_storage"
     db_dir.mkdir()
@@ -88,3 +100,71 @@ def test_extract_log_is_private(tmp_path):
 
     assert log_path.read_text(encoding="utf-8") == "safe diagnostics\n"
     assert log_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_db_salt_manifest_is_private_and_skips_plaintext_sqlite(tmp_path):
+    db_dir = tmp_path / "db_storage"
+    encrypted = db_dir / "message" / "message_2.db"
+    plaintext = db_dir / "contact" / "contact.db"
+    backup = db_dir / "message" / "message_2.db.factory" / "old" / "message_2.db"
+    encrypted.parent.mkdir(parents=True)
+    plaintext.parent.mkdir(parents=True)
+    backup.parent.mkdir(parents=True)
+    encrypted.write_bytes(bytes(range(16)) + b"x" * 32)
+    plaintext.write_bytes(b"SQLite format 3\0" + b"x" * 32)
+    backup.write_bytes(b"z" * 48)
+
+    manifest = Path(key_extractor._stage_db_salt_manifest(str(db_dir), str(tmp_path)))
+
+    assert manifest.read_text(encoding="utf-8") == (
+        "000102030405060708090a0b0c0d0e0f\tmessage/message_2.db\n"
+    )
+    assert manifest.stat().st_mode & 0o777 == 0o600
+
+
+def test_lldb_capture_authenticates_sqlcipher_page1():
+    key = bytes(range(32))
+    salt = bytes(range(16))
+    page = bytearray(PAGE_SZ)
+    page[:SALT_SZ] = salt
+    page[SALT_SZ : PAGE_SZ - RESERVE_SZ + SALT_SZ] = b"x" * (
+        PAGE_SZ - RESERVE_SZ
+    )
+    mac_salt = bytes(value ^ 0x3A for value in salt)
+    mac_key = hashlib.pbkdf2_hmac("sha512", key, mac_salt, 2, 32)
+    page[PAGE_SZ - 64 :] = hmac.new(
+        mac_key,
+        page[SALT_SZ : PAGE_SZ - RESERVE_SZ + SALT_SZ]
+        + (1).to_bytes(4, "little"),
+        hashlib.sha512,
+    ).digest()
+
+    assert lldb_key_capture.verify_page1(key, bytes(page))
+    assert not lldb_key_capture.verify_page1(b"z" * 32, bytes(page))
+
+
+def test_lldb_capture_inventory_skips_plaintext_sqlite(tmp_path):
+    db_dir = tmp_path / "db_storage"
+    encrypted = db_dir / "message" / "message_1.db"
+    plaintext = db_dir / "contact" / "contact.db"
+    backup = db_dir / "message" / "message_1.db.factory" / "old" / "message_1.db"
+    encrypted.parent.mkdir(parents=True)
+    plaintext.parent.mkdir(parents=True)
+    backup.parent.mkdir(parents=True)
+    encrypted.write_bytes(bytes(range(16)) + b"x" * (PAGE_SZ - 16))
+    plaintext.write_bytes(b"SQLite format 3\0" + b"x" * (PAGE_SZ - 16))
+    backup.write_bytes(b"z" * PAGE_SZ)
+
+    rows = lldb_key_capture.load_encrypted_pages(db_dir)
+
+    assert [(relative, len(page)) for relative, page in rows] == [
+        ("message/message_1.db", PAGE_SZ)
+    ]
+
+
+def test_lldb_capture_key_file_is_private(tmp_path):
+    target = tmp_path / "keys.json"
+    lldb_key_capture.write_private_json(target, {"db": {"enc_key": "ab" * 32}})
+
+    assert json.loads(target.read_text(encoding="utf-8"))["db"]["enc_key"] == "ab" * 32
+    assert target.stat().st_mode & 0o777 == 0o600

@@ -134,6 +134,7 @@ _Static_assert(offsetof(sqlcipher_cipher_ctx_view_t, key) == 8,
 
 /* Forward declaration */
 static int read_db_salt(const char *path, char *salt_hex_out);
+static int is_hex_char(unsigned char c);
 
 /* nftw callback state for collecting DB files */
 #define MAX_DBS 256
@@ -321,6 +322,54 @@ static int nftw_collect_db(const char *fpath, const struct stat *sb,
     return 0;
 }
 
+static int safe_relative_db_name(const char *name) {
+    if (!name || !name[0] || name[0] == '/') return 0;
+    if (strcmp(name, "..") == 0 || strncmp(name, "../", 3) == 0 ||
+        strstr(name, "/../") != NULL) return 0;
+    return strchr(name, '\t') == NULL && strchr(name, '\r') == NULL &&
+           strchr(name, '\n') == NULL;
+}
+
+static int load_db_salt_manifest(const char *path) {
+    FILE *manifest = fopen(path, "r");
+    if (!manifest) return -1;
+
+    char line[2048];
+    int loaded = 0;
+    while (g_db_count < MAX_DBS && fgets(line, sizeof(line), manifest)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = '\0';
+        const char *salt = line;
+        const char *name = tab + 1;
+        if (strlen(salt) != SALT_SIZE * 2 || !safe_relative_db_name(name))
+            continue;
+        int valid_salt = 1;
+        for (size_t i = 0; i < SALT_SIZE * 2; i++) {
+            if (!is_hex_char((unsigned char)salt[i])) {
+                valid_salt = 0;
+                break;
+            }
+        }
+        if (!valid_salt) continue;
+
+        for (size_t i = 0; i < SALT_SIZE * 2; i++) {
+            unsigned char value = (unsigned char)salt[i];
+            g_db_salts[g_db_count][i] =
+                (value >= 'A' && value <= 'F') ? (char)(value + 32) : (char)value;
+        }
+        g_db_salts[g_db_count][SALT_SIZE * 2] = '\0';
+        strncpy(g_db_names[g_db_count], name, 255);
+        g_db_names[g_db_count][255] = '\0';
+        printf("  %s\n", g_db_names[g_db_count]);
+        g_db_count++;
+        loaded++;
+    }
+    fclose(manifest);
+    return loaded;
+}
+
 static int is_hex_char(unsigned char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
@@ -450,6 +499,7 @@ int main(int argc, char *argv[]) {
     pid_t pid;
     const char *override_home = NULL;
     const char *override_db_root = NULL;
+    const char *salt_manifest = NULL;
     if (argc >= 2 && strcmp(argv[1], "--self-test") == 0)
         return run_struct_scanner_self_test();
     if (argc >= 2)
@@ -460,6 +510,8 @@ int main(int argc, char *argv[]) {
         override_home = argv[2];
     if (argc >= 4 && argv[3][0] != '\0')
         override_db_root = argv[3];
+    if (argc >= 5 && argv[4][0] != '\0')
+        salt_manifest = argv[4];
 
     if (pid <= 0) {
         fprintf(stderr, "WeChat not running or invalid PID\n");
@@ -499,7 +551,14 @@ int main(int argc, char *argv[]) {
      * Note: POSIX glob() does not support ** recursive matching on macOS,
      * so we use nftw() to walk the directory tree instead. */
     printf("\nScanning for DB files...\n");
-    if (override_db_root && override_db_root[0]) {
+    if (salt_manifest) {
+        int loaded = load_db_salt_manifest(salt_manifest);
+        if (loaded >= 0)
+            printf("  Loaded %d DB salts from user-staged manifest\n", loaded);
+        else
+            printf("  Unable to read user-staged DB salt manifest\n");
+    }
+    if (g_db_count == 0 && override_db_root && override_db_root[0]) {
         char resolved[PATH_MAX];
         const char *db_root = realpath(override_db_root, resolved);
         if (!db_root) db_root = override_db_root;

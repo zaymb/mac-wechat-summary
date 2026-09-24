@@ -61,7 +61,8 @@ def get_wechat_app_path():
     try:
         result = subprocess.run(
             ["osascript", "-e", 'POSIX path of (path to application "WeChat")'],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
         )
         path = result.stdout.strip()
@@ -134,8 +135,50 @@ def _write_extract_log(text, append=False):
         raise
 
 
+def _stage_db_salt_manifest(db_dir, scan_dir):
+    """Stage DB salts while still running as the logged-in user.
+
+    macOS TCC can let the user process read WeChat's container while denying
+    the same path to the privileged scanner.  The scanner needs the salts to
+    recognize SQLCipher contexts, so pass a private, short-lived manifest into
+    the privileged process instead of asking it to walk the container.
+    """
+    manifest_path = os.path.join(scan_dir, "db-salts.tsv")
+    fd = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as manifest:
+            if not db_dir or not os.path.isdir(db_dir):
+                return manifest_path
+            for root, _dirs, files in os.walk(db_dir):
+                for name in sorted(files):
+                    if not name.endswith(".db"):
+                        continue
+                    path = os.path.join(root, name)
+                    rel_path = os.path.relpath(path, db_dir).replace("\\", "/")
+                    if any(part.endswith(".factory") for part in rel_path.split("/")):
+                        continue
+                    if any(char in rel_path for char in "\t\r\n"):
+                        continue
+                    try:
+                        with open(path, "rb") as database:
+                            header = database.read(16)
+                    except OSError:
+                        continue
+                    if len(header) != 16 or header[:15] == b"SQLite format 3":
+                        continue
+                    manifest.write(f"{header.hex()}\t{rel_path}\n")
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return manifest_path
+
+
 def _validated_staged_keys(keys, db_dir):
-    """Keep only candidates that cryptographically authenticate page 1."""
+    """Keep only candidates that validate against encrypted SQLite page 1."""
     if not isinstance(keys, dict) or not db_dir or not os.path.isdir(db_dir):
         return {}
 
@@ -151,7 +194,6 @@ def _validated_staged_keys(keys, db_dir):
             key = bytes.fromhex(key_hex)
         except ValueError:
             continue
-
         normalized = rel_path.replace("\\", "/").lstrip("/")
         path = os.path.realpath(os.path.join(root, normalized))
         try:
@@ -161,9 +203,14 @@ def _validated_staged_keys(keys, db_dir):
                 page1 = f.read(4096)
         except (OSError, ValueError):
             continue
-        if len(page1) == 4096 and verify_page1(key, page1):
+        if len(page1) == 4096 and _candidate_validates_page1(key, page1):
             validated[normalized] = {"enc_key": key_hex.lower()}
     return validated
+
+
+def _candidate_validates_page1(key, page1):
+    """Accept only candidates authenticated by SQLCipher page-one HMAC."""
+    return verify_page1(key, page1)
 
 
 def extract_keys():
@@ -187,8 +234,16 @@ def extract_keys():
     scan_tmp = tempfile.TemporaryDirectory(prefix=".key-scan-", dir=DATA_DIR)
     scan_dir = scan_tmp.name
     try:
+        salt_manifest = _stage_db_salt_manifest(db_dir, scan_dir)
+        scanner_args = [
+            C_BINARY,
+            str(pid),
+            home_dir,
+            db_dir,
+            salt_manifest,
+        ]
         result = subprocess.run(
-            ["sudo", "-n", C_BINARY, str(pid), home_dir, db_dir],
+            ["sudo", "-n", *scanner_args],
             capture_output=True, text=True,
             cwd=scan_dir,
             timeout=60,
@@ -204,13 +259,17 @@ def extract_keys():
             # Try interactive sudo via osascript dialog
             shell_command = (
                 f"cd {shlex.quote(scan_dir)} && "
-                f"{shlex.quote(C_BINARY)} {pid} {shlex.quote(home_dir)} {shlex.quote(db_dir)}"
+                + " ".join(shlex.quote(arg) for arg in scanner_args)
+            )
+            _write_extract_log(
+                "\n=== interactive authorization requested ===\n",
+                append=True,
             )
             result = subprocess.run(
                 ["osascript", "-e",
                  f"do shell script {json.dumps(shell_command)} with administrator privileges"],
                 capture_output=True, text=True,
-                timeout=60,
+                timeout=180,
             )
             _write_extract_log(
                 "\n=== osascript stdout ===\n"
@@ -246,8 +305,16 @@ def extract_keys():
         _save_keys_atomically(keys)
         return keys
     except subprocess.TimeoutExpired:
+        _write_extract_log(
+            "\n=== extraction timed out before completion ===\n",
+            append=True,
+        )
         return None
-    except Exception:
+    except Exception as exc:
+        _write_extract_log(
+            f"\n=== extraction failed: {type(exc).__name__} ===\n",
+            append=True,
+        )
         return None
     finally:
         scan_tmp.cleanup()
@@ -377,6 +444,8 @@ def check_new_databases(db_dir, keys):
                 continue
             full = os.path.join(root, fname)
             rel = os.path.relpath(full, db_dir).replace("\\", "/")
+            if any(part.endswith(".factory") for part in rel.split("/")):
+                continue
             if rel in normalized_keys:
                 continue  # Already has key
             # Read first 16 bytes to check if encrypted
