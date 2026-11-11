@@ -165,6 +165,36 @@ class IterMessagesAscendingTests(unittest.TestCase):
                 {f"same-{i}" for i in range(total)},
             )
 
+    def test_iter_falls_back_to_snapshot_when_live_shard_is_malformed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conn, db_path = self._seed(temp_dir)
+            _make_db(conn, 12)
+            conn.close()
+
+            class MalformedConnection:
+                def execute(self, *_args, **_kwargs):
+                    raise sqlite3.DatabaseError("database disk image is malformed")
+
+                def close(self):
+                    pass
+
+            db = _fake_db(db_path)
+            db._open_encrypted_conn = lambda _path: MalformedConnection()
+            db._open_snapshot_conn = lambda path: sqlite3.connect(path)
+
+            messages = [
+                message
+                for chunk in db.iter_messages_ascending(
+                    "room@chatroom", since_ts=999.0, batch_size=5
+                )
+                for message in chunk
+            ]
+
+            self.assertEqual(
+                [message["text"] for message in messages],
+                [f"message-{i}" for i in range(12)],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

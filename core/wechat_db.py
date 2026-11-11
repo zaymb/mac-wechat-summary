@@ -12,6 +12,7 @@ import sqlite3
 import tempfile
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
 import zstandard as zstd
 
@@ -279,6 +280,27 @@ class WeChatDB:
         conn.execute("PRAGMA cipher_compatibility = 4")
         conn.execute("PRAGMA cipher_page_size = 4096")
         return conn
+
+    def _open_snapshot_conn(self, rel_path):
+        """Open one immutable decrypted view of a live encrypted database.
+
+        Direct SQLCipher reads are the fast path, but WeChat's live WAL can
+        occasionally make a shard report ``database disk image is malformed``
+        mid-scan.  The snapshot cache decrypts the matching DB+WAL version and
+        publishes it only after the source stayed stable for the full build.
+        """
+        source = (
+            rel_path
+            if os.path.isabs(rel_path)
+            else os.path.join(self.db_dir, rel_path)
+        )
+        snapshot = self._get_decrypted_db(rel_path)
+        if not snapshot:
+            return None
+        if self._is_plain_sqlite(source):
+            return sqlite3.connect(snapshot)
+        uri = Path(snapshot).resolve().as_uri() + "?mode=ro&immutable=1"
+        return sqlite3.connect(uri, uri=True)
 
     def _load_contacts(self):
         """Load contacts."""
@@ -612,6 +634,7 @@ class WeChatDB:
         conn = self._open_encrypted_conn(rel_key)
         if not conn:
             raise RuntimeError(f"cannot open message shard: {rel_key}")
+        using_snapshot = False
         exact_after_ts = float(after_ts)
         cursor_sort_seq = None
         cursor_rowid = None
@@ -637,14 +660,25 @@ class WeChatDB:
                     where += " AND create_time <= ?"
                     params.append(until_ts)
                 params.append(batch_size)
-                rows = conn.execute(f"""
+                query = f"""
                     SELECT sort_seq, rowid, local_type, create_time, message_content,
                            WCDB_CT_message_content, status
                     FROM [{table_name}]
                     WHERE {where}
                     ORDER BY sort_seq ASC, rowid ASC
                     LIMIT ?
-                """, params).fetchall()
+                """
+                try:
+                    rows = conn.execute(query, params).fetchall()
+                except Exception:
+                    if using_snapshot:
+                        raise
+                    conn.close()
+                    conn = self._open_snapshot_conn(rel_key)
+                    if not conn:
+                        raise
+                    using_snapshot = True
+                    rows = conn.execute(query, params).fetchall()
                 if not rows:
                     return
                 for row in rows:
