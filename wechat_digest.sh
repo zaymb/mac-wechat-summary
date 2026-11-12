@@ -203,6 +203,49 @@ if [ -n "$PREVIOUS_RETRY_JSON" ]; then
   fi
 fi
 
+# --- Data-source freshness gate ---
+# Run the probe with the same Python executable that reads the databases.  A
+# launchd shell may have a different command environment from an interactive
+# terminal, and reader-created *.db-shm files are not evidence of new messages.
+WECHAT_DB_DIR="${WECHAT_DB_DIR:-$HOME/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/wxid_stf2nbp8r6c521_b6d5/db_storage}"
+SOURCE_STALE_MINUTES="${SOURCE_STALE_MINUTES:-60}"
+SOURCE_FRESHNESS_RESULT="$(
+  "$ALERT_PYTHON" "$REPO_DIR/source_freshness.py" \
+    --db-dir "$WECHAT_DB_DIR" \
+    --max-age-minutes "$SOURCE_STALE_MINUTES" \
+    2>>"$HOME/wechat-digest.stderr.log"
+)"
+SOURCE_FRESHNESS_STATUS=$?
+if [ "$SOURCE_FRESHNESS_STATUS" -eq 0 ]; then
+  record_digest_stage_status source-freshness 0 ""
+else
+  record_digest_stage_status source-freshness 1 ""
+  printf '[%s] source freshness gate failed: %s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S %Z')" \
+    "${SOURCE_FRESHNESS_RESULT:-no probe output}" \
+    >> "$HOME/wechat-digest.stderr.log"
+fi
+
+# --- Key-availability gate ---
+KEY_COUNT="$(
+  "$ALERT_PYTHON" -c \
+    'import sys; sys.path.insert(0, "/Users/alta/mac-wechat-summary")
+from core.key_extractor import get_cached_keys
+k = get_cached_keys()
+print(len(k) if k else 0)' 2>/dev/null | tail -1
+)"
+case "$KEY_COUNT" in
+  ''|0|*[!0-9]*)
+    record_digest_stage_status key-availability 1 ""
+    printf '[%s] key availability gate: get_cached_keys returned %s keys; MCP cannot open the WeChat db\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S %Z')" "${KEY_COUNT:-unreadable}" \
+      >> "$HOME/wechat-digest.stderr.log"
+    ;;
+  *)
+    record_digest_stage_status key-availability 0 ""
+    ;;
+esac
+
 SLICE_LABEL="$(
   set -o pipefail
   run_with_timeout "$ARCHIVE_TIMEOUT_SECONDS" \
