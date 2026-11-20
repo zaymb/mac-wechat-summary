@@ -3,8 +3,82 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from core.wechat_db import WeChatDB, _clean_msg_text
+
+
+class ReadOnlyDatabaseOpeningTests(unittest.TestCase):
+    def test_connection_is_immutable_and_rejects_writes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "live.sqlite")
+            with sqlite3.connect(db_path) as seed:
+                seed.execute("CREATE TABLE sample (value TEXT)")
+                seed.execute("INSERT INTO sample VALUES ('kept')")
+
+            db = object.__new__(WeChatDB)
+            db.db_dir = temp_dir
+            db.keys = {}
+            seen = []
+            real_connect = sqlite3.connect
+
+            def recording_connect(*args, **kwargs):
+                seen.append((args, kwargs))
+                return real_connect(*args, **kwargs)
+
+            with mock.patch("core.wechat_db.sqlite3.connect", recording_connect):
+                conn = db._open_encrypted_conn(db_path)
+                try:
+                    self.assertEqual(
+                        conn.execute("SELECT value FROM sample").fetchone()[0],
+                        "kept",
+                    )
+                    self.assertEqual(conn.execute("PRAGMA query_only").fetchone()[0], 1)
+                    with self.assertRaises(sqlite3.OperationalError):
+                        conn.execute("INSERT INTO sample VALUES ('changed')")
+                finally:
+                    conn.close()
+
+            self.assertEqual(len(seen), 1)
+            uri, = seen[0][0]
+            self.assertIn("mode=ro", uri)
+            self.assertIn("immutable=1", uri)
+            self.assertTrue(seen[0][1]["uri"])
+
+    def test_encrypted_source_is_never_passed_to_sqlite(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "live-encrypted.db")
+            snapshot = os.path.join(temp_dir, "snapshot.db")
+            with open(source, "wb") as handle:
+                handle.write(b"encrypted-source")
+            with sqlite3.connect(snapshot) as seed:
+                seed.execute("CREATE TABLE sample (value TEXT)")
+                seed.execute("INSERT INTO sample VALUES ('snapshot')")
+
+            db = object.__new__(WeChatDB)
+            db.db_dir = temp_dir
+            db.keys = {"live-encrypted.db": {"enc_key": "00" * 32}}
+            db._get_decrypted_db = lambda _path: snapshot
+            opened = []
+            real_connect = sqlite3.connect
+
+            def recording_connect(path, *args, **kwargs):
+                opened.append(path)
+                return real_connect(path, *args, **kwargs)
+
+            with mock.patch("core.wechat_db.sqlite3.connect", recording_connect):
+                conn = db._open_encrypted_conn("live-encrypted.db")
+                try:
+                    self.assertEqual(
+                        conn.execute("SELECT value FROM sample").fetchone()[0],
+                        "snapshot",
+                    )
+                finally:
+                    conn.close()
+
+            self.assertEqual(len(opened), 1)
+            self.assertIn("snapshot.db", opened[0])
+            self.assertNotIn("live-encrypted.db", opened[0])
 
 
 class CleanMessageTests(unittest.TestCase):

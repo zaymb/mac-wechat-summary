@@ -16,12 +16,6 @@ from pathlib import Path
 
 import zstandard as zstd
 
-try:
-    from pysqlcipher3 import dbapi2 as _sqlcipher
-    _HAS_SQLCIPHER = True
-except ImportError:
-    _HAS_SQLCIPHER = False
-
 from .snapshot_cache import DecryptedSnapshotCache, SnapshotCacheError
 
 _zstd_dctx = zstd.ZstdDecompressor()
@@ -34,6 +28,20 @@ _RE_APPMSG_TYPE = re.compile(r"<type>\s*(\d+)\s*</type>", re.DOTALL)
 # the exact predicate; this coarse lower bound exists only to enter the
 # SORTSEQ index near the durable cursor instead of scanning the whole shard.
 _SORT_SEQ_PER_SECOND = 1000
+
+
+def _open_immutable_sqlite(path):
+    """Open a SQLite file without permitting writes or sidecar creation.
+
+    Every caller receives a private decrypted snapshot or, for the uncommon
+    plaintext source database, an immutable view.  ``immutable=1`` is
+    deliberate: SQLite must never create, update, checkpoint, or lock files in
+    WeChat's live database directory.
+    """
+    uri = Path(path).resolve().as_uri() + "?mode=ro&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.execute("PRAGMA query_only=ON")
+    return conn
 
 
 def _sort_seq_lower_bound(timestamp):
@@ -228,9 +236,15 @@ class WeChatDB:
     def _get_decrypted_db(self, rel_path):
         """Get decrypted database path (with caching).
 
-        If the database is plaintext SQLite (unencrypted), returns the original path directly.
+        If the database is plaintext SQLite (unencrypted), returns the original
+        path.  Callers must open every returned path through
+        ``_open_immutable_sqlite``.
         """
-        db_path = os.path.join(self.db_dir, rel_path)
+        db_path = (
+            rel_path
+            if os.path.isabs(rel_path)
+            else os.path.join(self.db_dir, rel_path)
+        )
         if not os.path.exists(db_path):
             return None
 
@@ -255,52 +269,23 @@ class WeChatDB:
             return None
 
     def _open_encrypted_conn(self, rel_path):
-        """Open an encrypted DB directly via pysqlcipher3 (no full-file decrypt).
+        """Open an immutable decrypted snapshot of an encrypted source DB.
 
-        Falls back to the old decrypt-to-file path when pysqlcipher3 is unavailable.
-        Returns a sqlite3-compatible connection or None.
+        The method name is retained for existing callers.  It intentionally
+        never hands the live WeChat database to SQLite or SQLCipher: even a
+        query-only workload can otherwise update WAL/SHM state or take locks in
+        the application's active store.
         """
-        db_path = (
-            rel_path
-            if os.path.isabs(rel_path)
-            else os.path.join(self.db_dir, rel_path)
-        )
-        if not os.path.exists(db_path):
-            return None
-        if self._is_plain_sqlite(db_path):
-            return sqlite3.connect(db_path)
-        if not _HAS_SQLCIPHER:
-            decrypted = self._get_decrypted_db(rel_path)
-            return sqlite3.connect(decrypted) if decrypted else None
-        enc_key = self._get_key(rel_path)
-        if not enc_key:
-            return None
-        conn = _sqlcipher.connect(db_path)
-        conn.execute(f"PRAGMA key = \"x'{enc_key}'\"")
-        conn.execute("PRAGMA cipher_compatibility = 4")
-        conn.execute("PRAGMA cipher_page_size = 4096")
-        return conn
+        snapshot = self._get_decrypted_db(rel_path)
+        return _open_immutable_sqlite(snapshot) if snapshot else None
 
     def _open_snapshot_conn(self, rel_path):
         """Open one immutable decrypted view of a live encrypted database.
 
-        Direct SQLCipher reads are the fast path, but WeChat's live WAL can
-        occasionally make a shard report ``database disk image is malformed``
-        mid-scan.  The snapshot cache decrypts the matching DB+WAL version and
-        publishes it only after the source stayed stable for the full build.
+        The snapshot cache decrypts the matching DB+WAL version and publishes
+        it only after the source stayed stable for the full build.
         """
-        source = (
-            rel_path
-            if os.path.isabs(rel_path)
-            else os.path.join(self.db_dir, rel_path)
-        )
-        snapshot = self._get_decrypted_db(rel_path)
-        if not snapshot:
-            return None
-        if self._is_plain_sqlite(source):
-            return sqlite3.connect(snapshot)
-        uri = Path(snapshot).resolve().as_uri() + "?mode=ro&immutable=1"
-        return sqlite3.connect(uri, uri=True)
+        return self._open_encrypted_conn(rel_path)
 
     def _load_contacts(self):
         """Load contacts."""
@@ -317,7 +302,7 @@ class WeChatDB:
         names = {}
         full = []
         nick_to_remark = {}  # nickname → alias (reverse mapping for looking up alias by nickname in group messages)
-        conn = sqlite3.connect(path)
+        conn = _open_immutable_sqlite(path)
         try:
             for r in conn.execute("SELECT username, nick_name, remark FROM contact"):
                 uname, nick, remark = r
@@ -345,7 +330,7 @@ class WeChatDB:
         if not path:
             return
         try:
-            conn = sqlite3.connect(path)
+            conn = _open_immutable_sqlite(path)
             rows = conn.execute(
                 "SELECT md5, cdn_url, aes_key, thumb_url"
                 " FROM kNonStoreEmoticonTable"
@@ -399,7 +384,7 @@ class WeChatDB:
             return []
 
         self._load_contacts()
-        conn = sqlite3.connect(path)
+        conn = _open_immutable_sqlite(path)
         try:
             rows = conn.execute("""
                 SELECT username, unread_count, summary, last_timestamp
@@ -447,8 +432,7 @@ class WeChatDB:
     def _find_msg_table(self, username):
         """Find all databases containing a user's message table.
 
-        When pysqlcipher3 is available, opens encrypted DBs directly (no full
-        decrypt). Falls back to the old snapshot-cache path otherwise.
+        Every shard is opened through the immutable decrypted snapshot cache.
 
         Returns:
             (list[str], str): (rel_keys, table_name), returns ([], None) if not found.
@@ -1029,7 +1013,7 @@ class WeChatDB:
         self._load_contacts()
         results = {}
 
-        fts_conn = sqlite3.connect(fts_path, timeout=5)
+        fts_conn = _open_immutable_sqlite(fts_path)
         try:
             name2id, id2name, id2sender_name = self._build_fts_lookup(fts_conn)
         except Exception as e:
@@ -1283,7 +1267,7 @@ class WeChatDB:
         if not fts_path:
             return {}
 
-        fts_conn = sqlite3.connect(fts_path, timeout=5)
+        fts_conn = _open_immutable_sqlite(fts_path)
         try:
             name2id = dict(fts_conn.execute("SELECT username, rowid FROM name2id").fetchall())
         except Exception:
